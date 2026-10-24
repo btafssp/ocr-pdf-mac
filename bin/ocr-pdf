@@ -24,7 +24,9 @@
 #   4. PyMuPDF: page image + Kraken words as an invisible text layer
 #   5. ocrmypdf --ocr-engine none --mode skip --optimize 3 (JBIG2/compression
 #      only; ocrmypdf never runs any OCR engine here)
-#   6. sanity check (page count, text present), then move into place
+#   6. sanity check (page count, at least 50 characters per page), then move
+#      into place. Fewer characters than that is treated as no text and not
+#      saved. More than half the pages empty is a warning; the PDF is kept.
 #
 # Every stage has a timeout / stall watchdog: if something stops making
 # progress you get an alert saying which stage, instead of a spinning gear.
@@ -74,8 +76,8 @@ export LC_ALL="${LC_ALL:-en_US.UTF-8}"
 SELF="${0:A}"
 LOG="$HOME/Library/Logs/pdf_inbox_pipeline.log"
 STATE_DIR="$HOME/Library/Application Support/pdf_inbox_pipeline"
-# Keep this fallback in step with share/ocr-pdf/VERSION and the formula.
-VERSION=0.1.0
+# Keep this fallback in step with share/ocr-pdf/VERSION.
+VERSION=0.1.1
 _verfile="${SELF:h:h}/share/ocr-pdf/VERSION"
 if [[ -r $_verfile ]]; then
   VERSION=$(<"$_verfile")
@@ -516,6 +518,12 @@ process_one() {
   fi
   local -a grays=("$WORK"/gray/*.png(on))
   log "cleaned: $sheets sheets -> ${#grays} pages ($(elapsed $((EPOCHSECONDS - t0))))"
+  # run_kraken divides by the page count. An empty list is zero pages.
+  if (( ${#grays} == 0 )); then
+    log "ERROR: no page images after cleanup for $BASE"
+    alert "OCR PDF: failed" "No page images were produced for $BASE. Nothing was saved. See $LOG"
+    return 1
+  fi
 
   # --- 3. Kraken ---
   MODEL=$(find_model)
@@ -560,23 +568,32 @@ process_one() {
   fi
 
   # --- 6. verify + move into place ---
-  local vp vchars vempty
+  local vp vchars vempty half_empty=0
   read vp vchars vempty <<<"$("$PY" "$WORK/verify.py" "$final" 2>>"$LOG")"
   if [[ "$vp" != "$npages" ]]; then
     alert "OCR PDF: failed" "Output has ${vp:-?} pages but $npages were expected. Nothing was saved."; return 1
   fi
-  if (( ${vchars:-0} == 0 )); then
-    log "ERROR: Kraken produced no text for $BASE"
+  # Same refusal as every page empty: too little text is not a usable PDF.
+  if (( ${vchars:-0} < 50 * npages )); then
+    log "ERROR: Kraken produced no text for $BASE (${vchars:-0} chars, $npages pages, under 50 per page)"
     alert "OCR PDF: failed" "Kraken produced no text for $BASE. Nothing was saved. See $LOG"
     return 1
+  fi
+  if (( ${vempty:-0} * 2 > npages )); then
+    half_empty=1
+    log "WARNING: more than half the pages came back empty ($vempty of $npages) for $BASE"
   fi
   mv -f "$final" "$out" || { alert "OCR PDF: failed" "Could not write $out"; return 1; }
   if [[ "$KEEP_ALTO" == 1 ]]; then rm -rf "${out%.pdf}_alto"; cp -R "$WORK/alto" "${out%.pdf}_alto"; fi
 
   local took=$(elapsed $((EPOCHSECONDS - t0))) size=$(du -h "$out" | cut -f1)
   local note=""; (( ${#missing} )) && note=" — ${#missing} page(s) without text"
+  (( half_empty )) && note+=" — more than half the pages are empty ($vempty of $npages)"
   log "DONE $out: $vp pages, $vchars chars, $vempty near-empty pages, $size, $took$note"
   notify "Done: ${out:t} ($vp pages, $took)$note" "$BASE"
+  if (( half_empty )); then
+    alert "OCR PDF: warning" "More than half the pages of $BASE came back empty ($vempty of $npages). The PDF was still saved."
+  fi
   print -r -- "DONE=$out"
   return 0
 }

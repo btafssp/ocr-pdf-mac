@@ -89,4 +89,4 @@ To release a new version:
 2. Set `sha256` in `packaging/homebrew/ocr-pdf.rb` from `shasum -a 256` of that tarball.
 3. Copy the formula to `btafssp/homebrew-tap` as `Formula/ocr-pdf.rb`.
 
-Keep `share/ocr-pdf/VERSION`, the `0.1.0` fallback in the scripts, and the formula version the same.
+Keep `share/ocr-pdf/VERSION` and the version fallback in the scripts the same. Update the formula URL and sha256 when you tag the release.
