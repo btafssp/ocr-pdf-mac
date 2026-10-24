@@ -1,8 +1,8 @@
 class OcrPdf < Formula
   desc "OCR scanned PDFs from Finder with Kraken"
   homepage "https://github.com/btafssp/ocr-pdf-mac"
-  url "https://github.com/btafssp/ocr-pdf-mac/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "c421a0b5ebfa5f837476f8081c78e9e88afbbf97ecd978f76aeaf5d1fe297673"
+  url "https://github.com/btafssp/ocr-pdf-mac/archive/refs/tags/v0.1.1.tar.gz"
+  sha256 "b063444e63b1a079df675edc76addfb0fdc3055473ef965fd9a73379a53f0fdf"
   license "GPL-3.0-only"
 
   depends_on arch: :arm64
@@ -38,8 +38,8 @@ class OcrPdf < Formula
   end
 
   test do
-    assert_match "0.1.0", shell_output("#{bin}/ocr-pdf --version")
-    assert_match "0.1.0", shell_output("#{bin}/ocr-pdf-setup --version")
+    assert_match version.to_s, shell_output("#{bin}/ocr-pdf --version")
+    assert_match version.to_s, shell_output("#{bin}/ocr-pdf-setup --version")
     assert_path_exists pkgshare/"requirements.txt"
     assert_path_exists pkgshare/"make-smoke-pdf.py"
     assert_path_exists pkgshare/"OCR PDF.workflow/Contents/document.wflow"
