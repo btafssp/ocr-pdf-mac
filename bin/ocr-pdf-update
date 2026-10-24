@@ -1,0 +1,293 @@
+#!/bin/zsh
+# Copyright (C) 2026 Brian T. Austin
+# SPDX-License-Identifier: GPL-3.0-only
+# ocr-pdf-update: monthly self-update of the Kraken OCR venv that the
+# "OCR PDF" Quick Action (ocr-pdf) uses.
+#
+# Kraken is not a Homebrew formula: it lives in a pip venv at ~/.venvs/kraken
+# built on Homebrew's python@3.13, so `brew upgrade` never updates it.
+#
+# What it does, in order:
+#   1. Health check: does the venv's python run and import kraken/torch/pymupdf/PIL/scipy.sparse.linalg?
+#      If not (e.g. Homebrew removed or broke python@3.13), rebuild the venv on
+#      python@3.13 or the newest Homebrew python3.x, from the last good
+#      `pip freeze` snapshot, or from the pinned requirements shipped with
+#      ocr-pdf. The CATMuS model lives outside the venv
+#      (~/Library/Application Support/htrmopo) and is never touched.
+#   2. Snapshot: save `pip freeze` as a rollback point (last 12 kept).
+#   3. Upgrade: pip install --upgrade kraken, constrained to pymupdf<2 and scipy>=1.16.
+#      If no release can satisfy scipy>=1.16, say so and stop. No notification.
+#   4. Smoke test: build a one-page image-only PDF of public-domain text and
+#      run ocr-pdf headless (NO_UI=1 OCR_LANGS=lat MODE=spectre). Check that
+#      real text comes out. No scanned book is used.
+#   5. On failure: roll back to the snapshot (pip install -r, remove extras),
+#      re-test, and post a macOS notification.
+#
+# Schedule: 1st of the month, 4:47 AM (after a daily 4:00 AM brew upgrade).
+# Log: ~/Library/Logs/kraken_update.log
+set -u
+setopt pipefail nullglob extendedglob
+zmodload zsh/datetime
+
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1
+
+# Top-level only. Inside a function, zsh sets $0 to the function name.
+SHARE="${0:A:h:h}/share/ocr-pdf"
+VERSION=0.1.0
+if [[ -r "$SHARE/VERSION" ]]; then
+  VERSION=$(<"$SHARE/VERSION")
+  VERSION=${VERSION//[[:space:]]/}
+fi
+if [[ -n ${OCR_PDF_BIN:-} ]]; then
+  PIPELINE=$OCR_PDF_BIN
+elif [[ -x ${0:A:h}/ocr-pdf ]]; then
+  PIPELINE=${0:A:h}/ocr-pdf
+elif [[ -x /opt/homebrew/bin/ocr-pdf ]]; then
+  PIPELINE=/opt/homebrew/bin/ocr-pdf
+elif [[ -x /usr/local/bin/ocr-pdf ]]; then
+  PIPELINE=/usr/local/bin/ocr-pdf
+else
+  PIPELINE=${0:A:h}/ocr-pdf
+fi
+RUN_USER=$(id -un)
+
+VENV="${KRAKEN_VENV:-$HOME/.venvs/kraken}"
+STATE="$HOME/Library/Application Support/pdf_inbox_pipeline"
+SNAPDIR="$STATE/kraken-snapshots"
+MODEL_GLOB=("$HOME/Library/Application Support/htrmopo"/*/catmus-print-fondue-large.mlmodel)
+LOG="$HOME/Library/Logs/kraken_update.log"
+SMOKE_MIN_CHARS=800          # the generated page is longer than this
+PIP_TIMEOUT=1800             # seconds; torch wheels are big
+SMOKE_TIMEOUT=900
+
+usage() {
+  cat <<'EOF'
+ocr-pdf-update — monthly update of the Kraken venv used by OCR PDF.
+
+  ocr-pdf-update                 update, then smoke-test
+  ocr-pdf-update --dry-run       show what pip would change; still smoke-tests
+  ocr-pdf-update --smoke-only    only run the smoke test
+  ocr-pdf-update --version
+
+The venv is ~/.venvs/kraken (or $KRAKEN_VENV). A broken venv is rebuilt from
+the newest pip snapshot, then from the pinned requirements shipped with
+ocr-pdf. The CATMuS-Print model is not modified. The upgrade cannot
+downgrade scipy below 1.16 (that wheel does not load on macOS 27).
+
+The smoke test draws a one-page image-only PDF of public-domain text and
+runs ocr-pdf on it. It does not read a PDF you already have.
+
+Schedule: 1st of the month, 4:47. Log: ~/Library/Logs/kraken_update.log
+EOF
+}
+
+DRY_RUN=0 SMOKE_ONLY=0
+for a in "$@"; do
+  case $a in
+    --dry-run)    DRY_RUN=1 ;;
+    --smoke-only) SMOKE_ONLY=1 ;;
+    --version)    print -r -- "ocr-pdf-update $VERSION"; exit 0 ;;
+    -h|--help)    usage; exit 0 ;;
+    *)            print -u2 "unknown option: $a (try --help)"; exit 2 ;;
+  esac
+done
+
+# ---- logging: append to the log; also echo to the terminal when run by hand
+mkdir -p "${LOG:h}" "$SNAPDIR"
+if [[ -t 1 ]]; then exec > >(tee -a "$LOG") 2>&1; else exec >>"$LOG" 2>&1; fi
+
+log()    { print -r -- "$(strftime '%Y-%m-%d %H:%M:%S' $EPOCHSECONDS) $*"; }
+notify() {  # notify "message"
+  /usr/bin/osascript - "$1" >/dev/null 2>&1 <<'AS'
+on run argv
+  display notification (item 1 of argv) with title "Kraken update"
+end run
+AS
+}
+# with_timeout SECS cmd...: SIGALRM survives exec, so the command dies after SECS.
+with_timeout() { local s=$1; shift; /usr/bin/perl -e 'alarm shift; exec @ARGV or exit 127' "$s" "$@"; }
+
+log "===== kraken-update start (dry-run=$DRY_RUN smoke-only=$SMOKE_ONLY) ====="
+
+# ---- single instance; don't update underneath a running OCR job
+LOCK="$STATE/.kraken-update.lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  if [[ -n "$(/usr/bin/find "$LOCK" -maxdepth 0 -mmin +180 2>/dev/null)" ]]; then
+    rmdir "$LOCK"; mkdir "$LOCK"                      # stale lock (>3 h)
+  else log "another kraken-update is running; exiting"; exit 0; fi
+fi
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/kraken_update.XXXXXX")
+trap 'rm -rf "$WORK"; rmdir "$LOCK" 2>/dev/null' EXIT
+trap 'exit 130' INT TERM HUP
+
+# Match the pipeline only. "ocr-pdf-update" and "ocr-pdf-setup" do not match,
+# and neither does this pgrep command line (the next character is "(").
+if /usr/bin/pgrep -qf 'pdf_inbox_pipeline\.sh' || /usr/bin/pgrep -qf '(^|[^A-Za-z0-9_-])ocr-pdf( |$)'; then
+  log "an OCR job is running; skipping this time"; exit 0
+fi
+
+PY="$VENV/bin/python"
+pip() { with_timeout $PIP_TIMEOUT "$PY" -m pip "$@"; }
+
+venv_ok() {
+  [[ -x "$PY" ]] || return 1
+  with_timeout 180 "$PY" -c 'import kraken, torch, pymupdf, PIL, scipy.sparse.linalg' 2>&1 || return 1
+  with_timeout 60 "$VENV/bin/kraken" --version >/dev/null 2>&1
+}
+versions() {
+  "$PY" -c 'import sys; from importlib.metadata import version as v
+print("python", sys.version.split()[0], "| kraken", v("kraken"), "| torch", v("torch"), "| pymupdf", v("pymupdf"), "| scipy", v("scipy"))' 2>/dev/null \
+    || print "(versions unavailable)"
+}
+latest_snapshot() { local s=("$SNAPDIR"/freeze-*.txt(Nom)); (( $#s )) && print -r -- "$s[1]"; }
+
+# newest usable Homebrew python: python@3.13 first (matches the snapshot's wheels)
+pick_python() {
+  local c
+  for c in /opt/homebrew/opt/python@3.13/bin/python3.13 \
+           /opt/homebrew/opt/python@3.<->(NnOn)/bin/python3.<->(N); do
+    [[ -x $c ]] && "$c" -c 'import venv, ensurepip' 2>/dev/null && { print -r -- "$c"; return 0; }
+  done
+  return 1
+}
+
+rebuild_venv() {
+  local py snap req stamp=$(strftime '%Y%m%d-%H%M%S' $EPOCHSECONDS)
+  py=$(pick_python) || { log "ERROR: no usable Homebrew python3.x found"; return 1; }
+  snap=$(latest_snapshot)
+  log "rebuilding venv on $py from ${snap:-<no snapshot>}"
+  [[ -e "$VENV" ]] && mv "$VENV" "$VENV.broken-$stamp"
+  req="$SHARE/requirements.txt"
+  # kraken 7.1.1's metadata rejects scipy>=1.16. Install the pinned file anyway.
+  install_pinned() {
+    # A freeze lists every package. The resolver rejects kraken 7.1.1 with
+    # scipy 1.16.3, so install the file as written.
+    pip install --no-deps -r "$1"
+  }
+  if "$py" -m venv "$VENV" && pip install -q --upgrade pip &&
+     { { [[ -n $snap ]] && install_pinned "$snap"; } ||
+       { [[ -f $req ]] && log "snapshot install failed or missing; installing pinned requirements" && install_pinned "$req"; } ||
+       { log "pinned requirements failed or missing; installing current kraken instead"
+         pip install kraken pillow 'pymupdf<2' 'scipy>=1.16'; } }; then
+    log "venv rebuilt: $(versions)"
+    rm -rf "$VENV.broken-$stamp"
+    return 0
+  fi
+  log "ERROR: venv rebuild failed; restoring the old venv"
+  rm -rf "$VENV"; [[ -e "$VENV.broken-$stamp" ]] && mv "$VENV.broken-$stamp" "$VENV"
+  return 1
+}
+
+smoke_test() {
+  local d="$WORK/smoke" out res rc t0=$EPOCHREALTIME
+  rm -rf "$d"; mkdir -p "$d"
+  if ! "$PY" "$SHARE/make-smoke-pdf.py" "$d/smoketest.pdf"; then
+    log "smoke test: could not build the public-domain test page"
+    return 1
+  fi
+  with_timeout $SMOKE_TIMEOUT /usr/bin/env -i HOME="$HOME" USER="$RUN_USER" TMPDIR="$WORK" \
+      PATH=/usr/bin:/bin NO_UI=1 OCR_LANGS=lat MODE=spectre KRAKEN_VENV="$VENV" \
+      /bin/zsh "$PIPELINE" "$d/smoketest.pdf" </dev/null >"$WORK/smoke.log" 2>&1
+  rc=$?
+  out="$d/smoketest_lat.pdf"
+  if (( rc != 0 )) || [[ ! -s "$out" ]]; then
+    log "smoke test FAILED (pipeline rc=$rc). Pipeline output:"; sed 's/^/    /' "$WORK/smoke.log"
+    return 1
+  fi
+  res=$("$PY" - "$out" "$SMOKE_MIN_CHARS" <<'PYEOF'
+import sys, re, pymupdf
+d = pymupdf.open(sys.argv[1]); t = " ".join(p.get_text() for p in d)
+words = re.findall(r"[A-Za-z]+", t)
+common = sum(w.lower() in ("the", "of", "and", "in", "to", "is") for w in words)
+ok = len(d) == 1 and len(t) >= int(sys.argv[2]) and common >= 15
+print("OK" if ok else "BAD", f"pages={len(d)} chars={len(t)} common_words={common} sample={' '.join(t.split())[:120]!r}")
+PYEOF
+) || res="BAD (text check crashed)"
+  log "smoke test ($(printf '%.0f' $((EPOCHREALTIME - t0)))s): $res"
+  [[ $res == OK* ]]
+}
+
+rollback() {
+  local snap=$1 extras
+  log "rolling back to $snap"
+  pip install -q -r "$snap" || { log "ERROR: pip install -r snapshot failed"; return 1; }
+  # remove packages the failed upgrade added
+  extras=( ${(f)"$("$PY" -m pip freeze --exclude-editable | sed 's/[=@ ].*//' | tr 'A-Z_' 'a-z-' | sort \
+          | comm -23 - <(sed '/^#/d; s/[=@ ].*//' "$snap" | tr 'A-Z_' 'a-z-' | sort))"} )
+  (( $#extras )) && { log "removing added packages: $extras"; pip uninstall -q -y $extras; }
+  log "after rollback: $(versions)"
+}
+
+# ---------------------------------------------------------------- main
+if (( $#MODEL_GLOB )); then log "model: $MODEL_GLOB[1]"
+else log "WARNING: CATMuS-Print model not found (this script does not download it)"; fi
+
+if (( SMOKE_ONLY )); then
+  log "versions: $(versions)"
+  smoke_test && { log "done"; exit 0; }
+  notify "Smoke test failed. See ~/Library/Logs/kraken_update.log"; log "FAILED"; exit 1
+fi
+
+# 1. health check / rebuild
+if ! venv_ok; then
+  log "venv is broken or missing: $VENV"
+  if (( DRY_RUN )); then log "dry run: would rebuild the venv now"; exit 1; fi
+  if ! rebuild_venv || ! venv_ok; then
+    notify "Kraken venv is broken and could not be rebuilt. OCR PDF will not work. See ~/Library/Logs/kraken_update.log"
+    log "FAILED"; exit 1
+  fi
+  notify "Kraken venv was rebuilt (Homebrew Python changed)."
+fi
+log "before: $(versions)"
+"$PY" -m pip check 2>&1 | sed "s/^/    pip check: /"
+
+# 2. snapshot (rollback point)
+SNAP="$SNAPDIR/freeze-$(strftime '%Y%m%d-%H%M%S' $EPOCHSECONDS).txt"
+{ print "# $(versions)"; "$PY" -m pip freeze --exclude-editable; } > "$SNAP.tmp" && mv "$SNAP.tmp" "$SNAP"
+log "snapshot: $SNAP ($(grep -vc '^#' "$SNAP") packages)"
+rm -f "$SNAPDIR"/freeze-*.txt(Nom[13,-1])   # keep the 12 newest
+
+# 3. upgrade
+print -l 'pymupdf<2' 'scipy>=1.16' > "$WORK/constraints.txt"
+CHANGED=0
+if (( DRY_RUN )); then
+  log "dry run: pip install --upgrade --dry-run kraken -c constraints (pymupdf<2, scipy>=1.16)"
+  pip install --upgrade --dry-run kraken -c "$WORK/constraints.txt" >"$WORK/pip-upgrade.log" 2>&1
+  PIP_RC=$?
+  if grep -q ResolutionImpossible "$WORK/pip-upgrade.log"; then
+    log "no kraken release is compatible with scipy>=1.16 yet; nothing changed"
+  else
+    grep -vE '^(Requirement already satisfied|Collecting|Using cached|Downloading)' "$WORK/pip-upgrade.log" | sed 's/^/    /' || true
+    log "dry run: pip exit $PIP_RC; nothing changed"
+  fi
+else
+  log "pip install --upgrade kraken (constraints pymupdf<2, scipy>=1.16)"
+  pip install --upgrade kraken -c "$WORK/constraints.txt" >"$WORK/pip-upgrade.log" 2>&1
+  PIP_RC=$?
+  cmp -s <("$PY" -m pip freeze --exclude-editable 2>/dev/null) <(grep -v '^#' "$SNAP") || CHANGED=1
+  if grep -q ResolutionImpossible "$WORK/pip-upgrade.log" && (( CHANGED == 0 )); then
+    log "no kraken release is compatible with scipy>=1.16 yet; nothing changed"
+    exit 0
+  fi
+  grep -v '^Requirement already satisfied' "$WORK/pip-upgrade.log" | sed 's/^/    /' || true
+  log "pip exit $PIP_RC; packages changed: $CHANGED"
+  (( PIP_RC != 0 && CHANGED == 0 )) && log "upgrade failed without changing anything (offline?); testing current install"
+fi
+log "after: $(versions)"
+
+# 4. smoke test, 5. rollback if it fails
+if smoke_test; then
+  if (( CHANGED )); then notify "Kraken updated: $(versions)"; log "updated"; else log "already up to date"; fi
+  log "done"; exit 0
+fi
+if (( CHANGED )); then
+  if rollback "$SNAP" && smoke_test; then
+    notify "Kraken update broke OCR, so it was rolled back. See ~/Library/Logs/kraken_update.log"
+    log "rolled back OK"; exit 1
+  fi
+  notify "Kraken update failed AND rollback failed. OCR PDF may not work. See ~/Library/Logs/kraken_update.log"
+else
+  notify "Kraken smoke test failed (nothing was changed). See ~/Library/Logs/kraken_update.log"
+fi
+log "FAILED"; exit 1

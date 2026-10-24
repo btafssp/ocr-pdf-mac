@@ -1,0 +1,623 @@
+#!/bin/zsh
+# Copyright (C) 2026 Brian T. Austin
+# SPDX-License-Identifier: GPL-3.0-only
+# =============================================================================
+# ocr-pdf — OCR scanned PDFs with Kraken (Finder Quick Action)
+#
+# Rewritten 2026-10-24 (Kraken only; Tesseract removed).
+#
+#   original.pdf              left untouched
+#   original_lat+ita.pdf      new file next to it (name = chosen languages)
+#
+# Pipeline, per input PDF:
+#   0. checks: tools present, PDF readable, and NOT already a born-digital
+#      (publisher) PDF with real visible text  -> those are skipped with an
+#      alert (FORCE=1 overrides). An old invisible OCR layer (ScanSnap,
+#      Tesseract, ...) is fine: it is replaced.
+#   1. language picker (one dialog; OCR_LANGS=lat+ita skips it)
+#   2. per sheet, in parallel (all cores):
+#        Ghostscript rasterize at $DPI grayscale
+#        -> unpaper (split 2-up spreads, deskew, despeckle, black filter)
+#        -> Pillow: cleaned grayscale copy for Kraken + final image per $MODE
+#   3. Kraken (CATMuS-Print) segment -bl + ocr -> one ALTO file per page,
+#      several Kraken workers in parallel, with a stall watchdog
+#   4. PyMuPDF: page image + Kraken words as an invisible text layer
+#   5. ocrmypdf --ocr-engine none --mode skip --optimize 3 (JBIG2/compression
+#      only; ocrmypdf never runs any OCR engine here)
+#   6. sanity check (page count, text present), then move into place
+#
+# Every stage has a timeout / stall watchdog: if something stops making
+# progress you get an alert saying which stage, instead of a spinning gear.
+# Progress shows as macOS notifications (no windows, no focus stealing).
+# Log: ~/Library/Logs/pdf_inbox_pipeline.log
+#
+# Usage:
+#   ocr-pdf [--version] [--no-blackfilter] [--keep-alto] [--force] file.pdf ...
+#   Automator:  MODE=spectre "/opt/homebrew/bin/ocr-pdf" "$@"
+#
+# Environment:
+#   MODE=bw|dither|gray|spectre  default bw; spectre = 300 dpi Otsu B&W, TIFF
+#   DPI=250                      raster dpi (spectre: SPECTRE_DPI, default 300)
+#   SPLIT=auto|always|never      auto: page wider than 1.25:1 = 2-up spread
+#   BLACKFILTER=on|off           unpaper black-border filter (off for faint print)
+#   OCR_LANGS=lat+ita            skip the picker (languages only name the file;
+#                                CATMuS-Print is multilingual)
+#   KEEP_ALTO=1                  keep ALTO XML in <output>_alto/
+#   OUTPUT_TYPE=pdf|pdfa         default pdf
+#   FORCE=1                      OCR even a PDF that already has real text
+#   KRAKEN_VENV=~/.venvs/kraken  KRAKEN_MODEL=/path/model.mlmodel
+#   GLYPHLESS_FONT=/path/pdf.ttf invisible-text font (default: tessdata pdf.ttf)
+#   KRAKEN_DEVICE=cpu|mps        default cpu
+#   KRAKEN_JOBS=N                parallel Kraken workers (default: min(cores/2, RAM GB/5, 4))
+#   PAGE_TIMEOUT=240             seconds without progress before giving up
+#   NO_UI=1                      no notifications / dialogs (testing, Terminal)
+#   JPEG_QUALITY=32  BW_THRESHOLD=165
+# =============================================================================
+
+emulate -R zsh
+setopt pipefail nounset extendedglob nullglob
+zmodload zsh/datetime zsh/system
+
+# Automator gives us a minimal PATH; ocrmypdf also needs gs/jbig2 on PATH.
+# Apple Silicon Homebrew lives at /opt/homebrew; Intel Homebrew at /usr/local.
+# Where this was written, brew is /opt/homebrew, so the paths match the old ones.
+if [[ -x /opt/homebrew/bin/brew ]]; then
+  BREW_PREFIX=/opt/homebrew
+elif [[ -x /usr/local/bin/brew ]]; then
+  BREW_PREFIX=/usr/local
+else
+  BREW_PREFIX=/opt/homebrew
+fi
+export PATH="$BREW_PREFIX/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export LC_ALL="${LC_ALL:-en_US.UTF-8}"
+
+SELF="${0:A}"
+LOG="$HOME/Library/Logs/pdf_inbox_pipeline.log"
+STATE_DIR="$HOME/Library/Application Support/pdf_inbox_pipeline"
+# Keep this fallback in step with share/ocr-pdf/VERSION and the formula.
+VERSION=0.1.0
+_verfile="${SELF:h:h}/share/ocr-pdf/VERSION"
+if [[ -r $_verfile ]]; then
+  VERSION=$(<"$_verfile")
+  VERSION=${VERSION//[[:space:]]/}
+fi
+unset _verfile
+
+# Absolute tool paths. The Homebrew prefix is tried first, then PATH.
+resolve_tool() {
+  local name=$1 p
+  local -a cands
+  cands=("$BREW_PREFIX/bin/$name" "/opt/homebrew/bin/$name" "/usr/local/bin/$name")
+  for p in "${cands[@]}"; do
+    [[ -x $p ]] && { print -r -- "$p"; return 0; }
+  done
+  p=${commands[$name]:-}
+  [[ -n $p && -x $p ]] && { print -r -- "$p"; return 0; }
+  return 1
+}
+GS=$(resolve_tool gs || true)
+UNPAPER=$(resolve_tool unpaper || true)
+OCRMYPDF=$(resolve_tool ocrmypdf || true)
+SIPS=/usr/bin/sips
+OSASCRIPT=/usr/bin/osascript
+KRAKEN_VENV="${KRAKEN_VENV:-$HOME/.venvs/kraken}"
+PY="$KRAKEN_VENV/bin/python"        # has Pillow + PyMuPDF; used for all Python
+KRAKEN="$KRAKEN_VENV/bin/kraken"
+
+# Invisible-text font from Tesseract's tessdata, when that formula is installed.
+# altolayer.py falls back to Helvetica when this file is missing.
+GLYPHLESS_FONT=${GLYPHLESS_FONT:-}
+if [[ -z $GLYPHLESS_FONT ]]; then
+  for _glyphless in \
+      "$BREW_PREFIX/share/tessdata/pdf.ttf" \
+      /opt/homebrew/share/tessdata/pdf.ttf \
+      /usr/local/share/tessdata/pdf.ttf \
+      /opt/homebrew/opt/tesseract/share/tessdata/pdf.ttf \
+      /usr/local/opt/tesseract/share/tessdata/pdf.ttf
+  do
+    [[ -f $_glyphless ]] && GLYPHLESS_FONT=$_glyphless && break
+  done
+  unset _glyphless
+fi
+
+# ---- settings ---------------------------------------------------------------
+MODE="${MODE:-bw}"
+DPI="${DPI:-250}"
+[[ "$MODE" == spectre ]] && DPI="${SPECTRE_DPI:-300}"
+SPLIT="${SPLIT:-auto}"
+BLACKFILTER="${BLACKFILTER:-on}"
+KEEP_ALTO="${KEEP_ALTO:-0}"
+OUTPUT_TYPE="${OUTPUT_TYPE:-pdf}"
+FORCE="${FORCE:-0}"
+NO_UI="${NO_UI:-0}"
+JPEG_QUALITY="${JPEG_QUALITY:-32}"
+BW_THRESHOLD="${BW_THRESHOLD:-165}"
+KRAKEN_DEVICE="${KRAKEN_DEVICE:-cpu}"
+KRAKEN_MODEL="${KRAKEN_MODEL:-}"
+PAGE_TIMEOUT="${PAGE_TIMEOUT:-240}"
+NCPU=$(/usr/sbin/sysctl -n hw.ncpu 2>/dev/null || echo 4)
+# Each Kraken worker is effectively single-core but holds ~3-4 GB of RAM, so
+# the default is limited by memory as well as cores: min(cores/2, GB/5, 4).
+MEM_GB=$(( $(/usr/sbin/sysctl -n hw.memsize 2>/dev/null || echo 8589934592) / 1073741824 ))
+KRAKEN_JOBS="${KRAKEN_JOBS:-$(( NCPU / 2 < MEM_GB / 5 ? NCPU / 2 : MEM_GB / 5 ))}"
+(( KRAKEN_JOBS > 4 )) && KRAKEN_JOBS=4
+(( KRAKEN_JOBS < 1 )) && KRAKEN_JOBS=1
+
+# ---- small helpers ----------------------------------------------------------
+log() {
+  print -r -- "$(strftime '%Y-%m-%d %H:%M:%S' $EPOCHSECONDS) [$$] $*" >>"$LOG" 2>/dev/null
+  print -r -- "$*" >&2
+}
+
+# Notification banner (never steals focus). Text passed as argv: no quoting bugs.
+notify() {  # notify "message" ["subtitle"]
+  [[ "$NO_UI" == 1 ]] && return 0
+  with_timeout 15 $OSASCRIPT - "$1" "${2:-}" >/dev/null 2>&1 <<'AS'
+on run argv
+  display notification (item 1 of argv) with title "OCR PDF" subtitle (item 2 of argv)
+end run
+AS
+}
+
+# Blocking alert, brought to the front (only used for errors / skips).
+alert() {   # alert "title" "message"
+  log "ALERT: $1 — $2"
+  [[ "$NO_UI" == 1 ]] && return 0
+  with_timeout 900 $OSASCRIPT - "$1" "$2" >/dev/null 2>&1 <<'AS'
+on run argv
+  activate
+  display alert (item 1 of argv) message (item 2 of argv) as warning giving up after 870
+end run
+AS
+}
+
+# with_timeout SECONDS cmd ...
+#   Runs cmd in its own process group; on timeout (exit 124) or when this
+#   wrapper gets TERM/INT/HUP, the whole group (cmd + its children, e.g.
+#   ocrmypdf's gs workers) is killed. Nothing can be left running.
+PERL_TIMEOUT='
+  my $t = shift;
+  my $pid = fork; die "fork: $!" unless defined $pid;
+  if ($pid == 0) { setpgrp(0, 0); exec @ARGV or exit 127; }
+  setpgrp($pid, $pid);
+  my $kill = sub { kill "TERM", -$pid; sleep 2; kill "KILL", -$pid; };
+  $SIG{ALRM} = sub { $kill->(); exit 124 };
+  $SIG{$_} = sub { $kill->(); exit 143 } for qw(TERM INT HUP);
+  alarm $t; waitpid($pid, 0); my $s = $?; alarm 0;
+  exit(($s & 127) ? 128 + ($s & 127) : $s >> 8);
+'
+with_timeout() { /usr/bin/perl -e "$PERL_TIMEOUT" "$@"; }
+
+elapsed() { printf '%dm%02ds' $(( $1 / 60 )) $(( $1 % 60 )); }
+
+# =============================================================================
+# Worker mode: one sheet (input PDF page) -> 1 or 2 cleaned page images.
+# Called in parallel via xargs as:  pdf_inbox_pipeline.sh __sheet N
+# Inputs come from exported variables (IN_PDF, WORK, DPI, MODE, ...).
+# =============================================================================
+if [[ "${1:-}" == __sheet ]]; then
+  n=$2; tag=$(printf 's%04d' $n); tmp="$WORK/sheets/$tag"
+  mkdir -p "$tmp"
+  fail() { print -r -- "$*" >"$WORK/fail/$tag"; log "sheet $n: $*"; rm -rf "$tmp"; exit 1; }
+
+  with_timeout 180 $GS -dSAFER -dBATCH -dNOPAUSE -dQUIET -sDEVICE=pnggray \
+      -r"$DPI" -dFirstPage=$n -dLastPage=$n -o "$tmp/sheet.png" "$IN_PDF" </dev/null \
+    || fail "Ghostscript failed or timed out rendering page $n"
+
+  # 2-up spread?
+  split=0
+  case "$SPLIT" in
+    always) split=1 ;;
+    never)  split=0 ;;
+    *) w=$($SIPS -g pixelWidth  "$tmp/sheet.png" | awk '/pixelWidth/{print $2}')
+       h=$($SIPS -g pixelHeight "$tmp/sheet.png" | awk '/pixelHeight/{print $2}')
+       awk -v w="${w:-0}" -v h="${h:-0}" 'BEGIN{exit !(h>0 && w/h>=1.25)}' && split=1 ;;
+  esac
+
+  bf=(); [[ "$BLACKFILTER" == (off|0|no) ]] && bf=(--no-blackfilter)
+  if (( split )); then
+    layout=(--layout double --output-pages 2); outs=("$tmp/half-%d.pgm")
+  else
+    layout=(--layout single); outs=("$tmp/half-1.pgm")
+  fi
+  with_timeout 180 $UNPAPER --overwrite --dpi "$DPI" $layout $bf \
+      "$tmp/sheet.png" $outs </dev/null >"$tmp/unpaper.log" 2>&1 \
+    || fail "unpaper failed or timed out on page $n"
+
+  halves=("$tmp"/half-*.pgm)
+  (( ${#halves} )) || fail "unpaper produced no output for page $n"
+  for f in $halves; do
+    k=${${f:t:r}#half-}
+    with_timeout 180 "$PY" "$WORK/topage.py" "$f" "$WORK/pages/$tag-$k" \
+        "$WORK/gray/$tag-$k.png" "$MODE" "$BW_THRESHOLD" "$JPEG_QUALITY" "$DPI" </dev/null \
+      || fail "image cleanup (Pillow) failed on page $n"
+  done
+  rm -rf "$tmp"
+  : >"$WORK/done/$tag"
+  exit 0
+fi
+
+# =============================================================================
+# Python helpers (written into the work dir at start)
+# =============================================================================
+write_helpers() {
+# --- textcheck.py: page count + is there real (visible) text already? -------
+cat >"$WORK/textcheck.py" <<'PY'
+import sys, pymupdf
+doc = pymupdf.open(sys.argv[1])
+if doc.needs_pass:
+    print("ENCRYPTED 0 0 0"); sys.exit()
+n = doc.page_count
+visible_pages = invisible = visible = 0
+for page in doc:
+    v = 0
+    for span in page.get_texttrace():
+        c = len(span["chars"])
+        if span["type"] == 3 or span.get("opacity", 1) == 0:
+            invisible += c          # invisible OCR layer (render mode 3)
+        else:
+            v += c                  # real, drawn text
+    visible += v
+    if v >= 200:
+        visible_pages += 1
+kind = "BORN_DIGITAL" if visible_pages >= max(1, n / 2) else ("OCR_LAYER" if invisible else "NONE")
+print(kind, n, visible, invisible)
+PY
+
+# --- topage.py: cleaned grayscale for Kraken + final page image per MODE ----
+cat >"$WORK/topage.py" <<'PY'
+import sys
+from PIL import Image, ImageFilter, ImageOps
+src, dst, gray, mode = sys.argv[1:5]
+thr, q, dpi = int(sys.argv[5]), int(sys.argv[6]), int(sys.argv[7])
+res = (dpi, dpi)
+im = Image.open(src).convert("L")
+im.save(gray, format="PNG", dpi=res)          # Kraken reads grayscale best
+if mode == "gray":
+    ImageOps.autocontrast(im, cutoff=1).save(dst + ".jpg", "JPEG", quality=q, optimize=True, dpi=res)
+elif mode == "dither":
+    ImageOps.autocontrast(im, cutoff=1).convert("1", dither=Image.Dither.FLOYDSTEINBERG).save(
+        dst + ".png", "PNG", optimize=True, dpi=res)
+elif mode == "spectre":
+    # Spectre-like B&W: autocontrast, Otsu threshold (+12 so thin type stays
+    # black), morphological open/close. No illumination flattening (it washed
+    # out thin, small type).
+    im = ImageOps.autocontrast(im, cutoff=0.2)
+    hist = im.histogram(); total = sum(hist) or 1
+    sum1 = sum(i * h for i, h in enumerate(hist))
+    wB = sumB = best = 0.0; otsu = 160
+    for t in range(256):
+        wB += hist[t]
+        if not wB: continue
+        wF = total - wB
+        if not wF: break
+        sumB += t * hist[t]
+        v = wB * wF * (sumB / wB - (sum1 - sumB) / wF) ** 2
+        if v >= best: best, otsu = v, t
+    cut = min(250, otsu + 12)
+    bw = im.point(lambda p: 255 if p > cut else 0)
+    bw = bw.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.MaxFilter(3))
+    bw.convert("1").save(dst + ".tif", "TIFF", compression="tiff_lzw", dpi=res)
+else:  # bw
+    im = ImageOps.autocontrast(im, cutoff=1).filter(ImageFilter.MedianFilter(3))
+    im.point(lambda p: 255 if p > thr else 0).convert("1").save(dst + ".png", "PNG", optimize=True, dpi=res)
+PY
+
+# --- altolayer.py: page images + invisible Kraken text -> one PDF -----------
+cat >"$WORK/altolayer.py" <<'PY'
+import sys, glob, os
+import xml.etree.ElementTree as ET
+import pymupdf
+pagedir, altodir, out, dpi = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
+k = 72.0 / dpi
+glyphless = sys.argv[5] if len(sys.argv) > 5 else ""   # invisible-text font, if present
+font = pymupdf.Font(fontfile=glyphless) if glyphless and os.path.exists(glyphless) else pymupdf.Font("helv")
+tag = lambda e: e.tag.rsplit("}", 1)[-1]
+doc = pymupdf.open()
+imgs = sorted(p for p in glob.glob(os.path.join(pagedir, "*"))
+              if p.lower().endswith((".png", ".jpg", ".tif")))
+for img in imgs:
+    pix = pymupdf.Pixmap(img); w, h = pix.width * k, pix.height * k; pix = None
+    page = doc.new_page(width=w, height=h)
+    page.insert_image(page.rect, filename=img)
+    alto = os.path.join(altodir, os.path.splitext(os.path.basename(img))[0] + ".xml")
+    if not os.path.exists(alto):
+        continue
+    for line in ET.parse(alto).getroot().iter():
+        if tag(line) != "TextLine":
+            continue
+        words = [s for s in line if tag(s) == "String" and s.get("CONTENT")]
+        if not words:
+            continue
+        box = [tuple(float(s.get(a, 0)) * k for a in ("HPOS", "VPOS", "WIDTH", "HEIGHT")) for s in words]
+        texts = [s.get("CONTENT").replace("\u00ac", "-") for s in words]   # CATMuS line-end hyphen
+        ly, lh = float(line.get("VPOS", 0)) * k, float(line.get("HEIGHT", 0)) * k
+        size = max(lh * 0.75, 4.0)
+        # one horizontal scale per line, so the line extracts as one line
+        natural = font.text_length(" ".join(texts), fontsize=size) or 1.0
+        x0 = box[0][0]; x1 = max(bx + bw for bx, _, bw, _ in box)
+        sx = max((x1 - x0) / natural, 0.05)
+        base = pymupdf.Point(x0, ly + lh * 0.8)
+        tw = pymupdf.TextWriter(page.rect)
+        for i, (t, (bx, _, _, _)) in enumerate(zip(texts, box)):
+            tw.append(pymupdf.Point(x0 + (bx - x0) / sx, base.y),
+                      t + (" " if i < len(texts) - 1 else ""), font=font, fontsize=size)
+        tw.write_text(page, render_mode=3, morph=(base, pymupdf.Matrix(sx, 1)))
+doc.save(out, garbage=3, deflate=True)
+print(len(imgs))
+PY
+
+# --- verify.py: final page count + amount of text ---------------------------
+cat >"$WORK/verify.py" <<'PY'
+import sys, pymupdf
+d = pymupdf.open(sys.argv[1])
+chars = sum(len(p.get_text().strip()) for p in d)
+empty = sum(1 for p in d if len(p.get_text().strip()) < 20)
+print(d.page_count, chars, empty)
+PY
+}
+
+# =============================================================================
+# Language picker
+# =============================================================================
+normalize_langs() {   # "Latin (lat)+ita, French" -> "lat+ita+fra" (fixed order)
+  local -a words out
+  local -A full=(latin lat italian ita french fra english eng spanish spa german deu)
+  local w c
+  words=(${=${${1:l}//[^a-z]/ }})
+  for w in $words; do [[ -n "${full[$w]:-}" ]] && words+=${full[$w]}; done
+  for c in lat ita fra eng spa deu; do (( ${words[(Ie)$c]} )) && out+=$c; done
+  print -r -- "${(j:+:)out}"
+}
+
+pick_langs() {   # pick_langs "file name"  -> prints e.g. lat+ita
+  if [[ -n "${OCR_LANGS:-}" ]]; then normalize_langs "$OCR_LANGS"; return; fi
+  [[ "$NO_UI" == 1 ]] && { print lat; return; }
+  local last="lat" chosen
+  [[ -r "$STATE_DIR/last_langs" ]] && last=$(<"$STATE_DIR/last_langs")
+  # Plain osascript (no Finder / System Events, so no Automation permission and
+  # no 2-minute Apple Event timeout). 'activate' brings the dialog to the front.
+  chosen=$(with_timeout 600 $OSASCRIPT - "$1" "$last" 2>>"$LOG" <<'AS'
+on run argv
+  set fname to item 1 of argv
+  set lastCodes to item 2 of argv
+  set langList to {"Latin (lat)", "Italian (ita)", "French (fra)", "English (eng)", "Spanish (spa)", "German (deu)"}
+  set defaults to {}
+  repeat with L in langList
+    if lastCodes contains (text -4 thru -2 of L) then set end of defaults to (L as text)
+  end repeat
+  if defaults is {} then set defaults to {"Latin (lat)"}
+  activate
+  set chosen to choose from list langList with title "OCR languages" with prompt ("Languages in:" & return & fname & return & return & "Command-click to choose several.") default items defaults OK button name "Start OCR" with multiple selections allowed
+  if chosen is false then return "CANCEL"
+  set AppleScript's text item delimiters to "+"
+  return chosen as text
+end run
+AS
+  ) || { print CANCEL; return; }
+  [[ "$chosen" == CANCEL || -z "$chosen" ]] && { print CANCEL; return; }
+  chosen=$(normalize_langs "$chosen")
+  mkdir -p "$STATE_DIR" && print -r -- "$chosen" >"$STATE_DIR/last_langs"
+  print -r -- "$chosen"
+}
+
+# =============================================================================
+# Kraken stage: parallel workers + stall watchdog
+# =============================================================================
+find_model() {
+  if [[ -n "$KRAKEN_MODEL" ]]; then [[ -f "$KRAKEN_MODEL" ]] && print -r -- "$KRAKEN_MODEL"; return; fi
+  local m=("$HOME/Library/Application Support/htrmopo"/*/catmus-print-fondue-large.mlmodel)
+  (( ${#m} )) && print -r -- "${m[1]}"
+}
+
+run_kraken() {   # run_kraken file1.png file2.png ...   (writes $WORK/alto/*.xml)
+  local -a imgs=("$@") pids args
+  local total=${#imgs} jobs=$KRAKEN_JOBS threads i w chunk start
+  (( jobs > total )) && jobs=$total
+  threads=$(( NCPU / jobs )); (( threads < 1 )) && threads=1
+  chunk=$(( (total + jobs - 1) / jobs ))
+  log "Kraken: $total pages, $jobs workers x $threads threads, device $KRAKEN_DEVICE"
+  for (( w = 0; w < jobs; w++ )); do
+    args=()
+    for (( i = w * chunk + 1; i <= (w + 1) * chunk && i <= total; i++ )); do
+      args+=(-i "${imgs[i]}" "$WORK/alto/${${imgs[i]:t}:r}.xml")
+    done
+    (( ${#args} )) || continue
+    OMP_NUM_THREADS=$threads with_timeout 86400 "$KRAKEN" -a -d "$KRAKEN_DEVICE" $args \
+      segment -bl ocr -m "$MODEL" </dev/null >"$WORK/kraken-$w.log" 2>&1 &
+    pids+=$!
+  done
+  watch_progress "Recognizing text (Kraken)" "$WORK/alto" '*.xml' $total $PAGE_TIMEOUT $pids
+}
+
+# watch_progress LABEL DIR GLOB TOTAL STALL_SECONDS PID...
+#   Waits for the PIDs while counting finished files in DIR. Sends a throttled
+#   notification as pages finish. If nothing new appears for STALL_SECONDS,
+#   kills the PIDs (and their process groups) and returns 124.
+watch_progress() {
+  local label=$1 dir=$2 glob=$3 total=$4 stall=$5; shift 5
+  local -a pids=("$@") files
+  local done=0 last=-1 t_last=$EPOCHSECONDS t_note=0 alive p
+  while :; do
+    files=($dir/${~glob}); done=${#files}
+    if (( done != last )); then
+      last=$done; t_last=$EPOCHSECONDS
+      log "  $label: $done/$total"
+      if (( EPOCHSECONDS - t_note >= 6 || done == total )); then
+        notify "$label: page $done of $total" "$BASE"; t_note=$EPOCHSECONDS
+      fi
+    fi
+    alive=0; for p in $pids; do kill -0 $p 2>/dev/null && alive=1; done
+    (( alive )) || break
+    if (( EPOCHSECONDS - t_last > stall )); then
+      log "  $label: no progress for ${stall}s at $done/$total — killing"
+      for p in $pids; do kill -TERM $p 2>/dev/null; done
+      wait $pids 2>/dev/null
+      return 124
+    fi
+    sleep 1
+  done
+  local rc=0; for p in $pids; do wait $p || rc=$?; done
+  return $rc
+}
+
+# =============================================================================
+# One PDF
+# =============================================================================
+process_one() {
+  local pdf="${1:A}" t0=$EPOCHSECONDS
+  BASE="${pdf:t}"
+  [[ -f "$pdf" ]] || { alert "OCR PDF" "File not found: $pdf"; return 1; }
+  [[ "${pdf:l}" == *.pdf ]] || { alert "OCR PDF" "Not a PDF: $BASE"; return 1; }
+  log "=== $pdf  (MODE=$MODE DPI=$DPI SPLIT=$SPLIT BLACKFILTER=$BLACKFILTER)"
+
+  # private temp dir; removed on any exit (this function runs in a subshell)
+  WORK=$(mktemp -d "${TMPDIR:-/tmp}/pdf_ocr.XXXXXX") || { alert "OCR PDF" "Cannot create temp dir"; return 1; }
+  # ($$ is the parent script inside a subshell; sysparams[pid] is this one)
+  cleanup() { pkill -TERM -P $sysparams[pid] 2>/dev/null; [[ -n "${WORK:-}" ]] && rm -rf "$WORK"; }
+  trap cleanup EXIT
+  trap 'cleanup; exit 143' TERM INT HUP
+  mkdir -p "$WORK"/{sheets,pages,gray,alto,done,fail}
+  write_helpers
+
+  # --- 0. existing text? ---
+  local info kind sheets vis inv
+  info=$(with_timeout 120 "$PY" "$WORK/textcheck.py" "$pdf" 2>>"$LOG") \
+    || { alert "OCR PDF: cannot read PDF" "$BASE could not be opened (damaged PDF?)."; return 1; }
+  read kind sheets vis inv <<<"$info"
+  log "text check: $kind, $sheets pages, visible chars $vis, invisible OCR chars $inv"
+  if [[ "$kind" == ENCRYPTED ]]; then
+    alert "OCR PDF: skipped" "$BASE is password-protected."; return 1
+  fi
+  if [[ "$kind" == BORN_DIGITAL && "$FORCE" != 1 ]]; then
+    alert "OCR PDF: skipped" "$BASE already has real (publisher) text on most pages, so it was not OCRed. Run with FORCE=1 to OCR it anyway."
+    return 0
+  fi
+  (( sheets > 0 )) || { alert "OCR PDF" "$BASE has no pages."; return 1; }
+
+  # --- 1. languages ---
+  local langs; langs=$(pick_langs "$BASE")
+  [[ "$langs" == CANCEL ]] && { log "cancelled at language picker"; return 0; }
+  [[ -n "$langs" ]] || langs=lat
+  local out="${pdf:h}/${${pdf:t}%.(#i)pdf}_${langs}.pdf"
+  log "languages: $langs -> ${out:t}"
+  notify "Starting: $sheets page(s), languages $langs" "$BASE"
+
+  # --- 2. rasterize + clean, all sheets in parallel ---
+  export IN_PDF="$pdf" WORK DPI MODE SPLIT BLACKFILTER BW_THRESHOLD JPEG_QUALITY LOG
+  seq 1 $sheets | with_timeout 86400 /usr/bin/xargs -P $NCPU -n 1 "$SELF" __sheet 2>>"$LOG" &
+  watch_progress "Cleaning page images" "$WORK/done" '*' $sheets $PAGE_TIMEOUT $!
+  local rc=$?
+  local -a failed=("$WORK"/fail/*)
+  if (( rc == 124 )); then
+    alert "OCR PDF: stopped" "Page cleanup stopped making progress (no page finished in ${PAGE_TIMEOUT}s). See $LOG"; return 1
+  elif (( ${#failed} )); then
+    alert "OCR PDF: failed" "$(cat $failed | head -3)"; return 1
+  fi
+  local -a grays=("$WORK"/gray/*.png(on))
+  log "cleaned: $sheets sheets -> ${#grays} pages ($(elapsed $((EPOCHSECONDS - t0))))"
+
+  # --- 3. Kraken ---
+  MODEL=$(find_model)
+  [[ -n "$MODEL" ]] || { alert "OCR PDF" "Kraken model CATMuS-Print (fondue-large) not found."; return 1; }
+  run_kraken $grays; rc=$?
+  if (( rc == 124 )); then
+    alert "OCR PDF: stopped" "Kraken stopped making progress (no page finished in ${PAGE_TIMEOUT}s). See $LOG"; return 1
+  fi
+  # retry any page without ALTO once, on its own
+  local g missing=()
+  for g in $grays; do [[ -s "$WORK/alto/${${g:t}:r}.xml" ]] || missing+=$g; done
+  if (( ${#missing} )); then
+    log "Kraken missed ${#missing} page(s) (rc=$rc); retrying them one by one"
+    for g in $missing; do
+      with_timeout $PAGE_TIMEOUT "$KRAKEN" -a -d cpu -i "$g" "$WORK/alto/${${g:t}:r}.xml" \
+        segment -bl ocr -m "$MODEL" </dev/null >>"$WORK/kraken-retry.log" 2>&1
+    done
+    missing=(); for g in $grays; do [[ -s "$WORK/alto/${${g:t}:r}.xml" ]] || missing+=${g:t:r}; done
+    if (( ${#missing} && ${#missing} == ${#grays} )); then
+      log "ERROR: Kraken produced no text on any of ${#grays} page(s) (rc=$rc)"
+      alert "OCR PDF: failed" "Kraken produced no text for $BASE. Nothing was saved. See $LOG"
+      return 1
+    fi
+    (( ${#missing} )) && log "WARNING: no text for ${#missing} page(s): ${missing}"
+  fi
+  log "Kraken done ($(elapsed $((EPOCHSECONDS - t0))))"
+
+  # --- 4. text layer PDF ---
+  notify "Building PDF…" "$BASE"
+  local npages=${#grays}
+  with_timeout $(( 120 + 10 * npages )) "$PY" "$WORK/altolayer.py" "$WORK/pages" "$WORK/alto" \
+      "$WORK/layered.pdf" "$DPI" "${GLYPHLESS_FONT:-}" >/dev/null 2>>"$LOG" \
+    || { alert "OCR PDF: failed" "Building the text layer failed or timed out. See $LOG"; return 1; }
+
+  # --- 5. compress (no OCR engine at all) ---
+  local final="$WORK/final.pdf"
+  if ! with_timeout $(( 180 + 15 * npages )) $OCRMYPDF --ocr-engine none --mode skip \
+        --output-type "$OUTPUT_TYPE" --optimize 3 --jpeg-quality "$JPEG_QUALITY" \
+        --jobs "$NCPU" --quiet "$WORK/layered.pdf" "$final" </dev/null >>"$LOG" 2>&1; then
+    log "WARNING: ocrmypdf optimize failed or timed out; keeping the uncompressed PDF"
+    final="$WORK/layered.pdf"
+  fi
+
+  # --- 6. verify + move into place ---
+  local vp vchars vempty
+  read vp vchars vempty <<<"$("$PY" "$WORK/verify.py" "$final" 2>>"$LOG")"
+  if [[ "$vp" != "$npages" ]]; then
+    alert "OCR PDF: failed" "Output has ${vp:-?} pages but $npages were expected. Nothing was saved."; return 1
+  fi
+  if (( ${vchars:-0} == 0 )); then
+    log "ERROR: Kraken produced no text for $BASE"
+    alert "OCR PDF: failed" "Kraken produced no text for $BASE. Nothing was saved. See $LOG"
+    return 1
+  fi
+  mv -f "$final" "$out" || { alert "OCR PDF: failed" "Could not write $out"; return 1; }
+  if [[ "$KEEP_ALTO" == 1 ]]; then rm -rf "${out%.pdf}_alto"; cp -R "$WORK/alto" "${out%.pdf}_alto"; fi
+
+  local took=$(elapsed $((EPOCHSECONDS - t0))) size=$(du -h "$out" | cut -f1)
+  local note=""; (( ${#missing} )) && note=" — ${#missing} page(s) without text"
+  log "DONE $out: $vp pages, $vchars chars, $vempty near-empty pages, $size, $took$note"
+  notify "Done: ${out:t} ($vp pages, $took)$note" "$BASE"
+  print -r -- "DONE=$out"
+  return 0
+}
+
+# =============================================================================
+# main
+# =============================================================================
+while [[ $# -gt 0 && "$1" == --* ]]; do
+  case "$1" in
+    --version)        print -r -- "ocr-pdf $VERSION"; exit 0 ;;
+    --help)           print -u2 "Usage: ${SELF:t} [--version] [--no-blackfilter] [--keep-alto] [--force] file.pdf ..."; exit 0 ;;
+    --no-blackfilter) BLACKFILTER=off ;;
+    --blackfilter)    BLACKFILTER=on ;;
+    --keep-alto)      KEEP_ALTO=1 ;;
+    --force)          FORCE=1 ;;
+    --engine=*|--kraken|--tesseract) log "note: $1 ignored (Kraken is the only engine now)" ;;
+    --) shift; break ;;
+    *) print -u2 "Unknown option: $1"; exit 2 ;;
+  esac
+  shift
+done
+if (( $# == 0 )); then
+  print -u2 "Usage: ${SELF:t} [--version] [--no-blackfilter] [--keep-alto] [--force] file.pdf ..."
+  exit 2
+fi
+
+mkdir -p "${LOG:h}"
+for tool in $GS $UNPAPER $OCRMYPDF $PY $KRAKEN; do
+  [[ -x "$tool" ]] || { alert "OCR PDF: missing tool" "Not found: $tool"; exit 1; }
+done
+"$PY" -c 'import PIL, pymupdf' 2>/dev/null \
+  || { alert "OCR PDF: missing Python module" "$PY needs Pillow and PyMuPDF:  $PY -m pip install pillow pymupdf"; exit 1; }
+
+# Stop button in the menu bar / Ctrl-C: take the running file's subshell down too.
+trap 'pkill -TERM -P $$ 2>/dev/null; exit 143' TERM INT HUP
+
+failures=0
+for f in "$@"; do
+  ( process_one "$f" ) || (( failures++ ))
+done
+# With UI on, errors were already shown in an alert; exit 0 so Automator does
+# not pop a second, cryptic error dialog. In Terminal/NO_UI, report failure.
+(( failures && NO_UI == 1 )) && exit 1
+exit 0
