@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template for ~/Library/LaunchAgents/local.kraken.update.plist.
+  ocr-pdf-setup replaces #OCR_PDF_UPDATE# with the ocr-pdf-update command
+  and #HOME# with the home directory. Do not load this file as it stands.
+  Schedule: day 1 of the month, 04:47, after a daily 04:00 brew upgrade.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>local.kraken.update</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/zsh</string>
+		<string>#OCR_PDF_UPDATE#</string>
+	</array>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Day</key>
+		<integer>1</integer>
+		<key>Hour</key>
+		<integer>4</integer>
+		<key>Minute</key>
+		<integer>47</integer>
+	</dict>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>Nice</key>
+	<integer>10</integer>
+	<key>StandardOutPath</key>
+	<string>#HOME#/Library/Logs/kraken_update.launchd.log</string>
+	<key>StandardErrorPath</key>
+	<string>#HOME#/Library/Logs/kraken_update.launchd.log</string>
+</dict>
+</plist>

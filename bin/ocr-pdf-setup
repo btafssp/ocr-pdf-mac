@@ -1,0 +1,333 @@
+#!/bin/zsh
+# Copyright (C) 2026 Brian T. Austin
+# SPDX-License-Identifier: GPL-3.0-only
+# ocr-pdf-setup — venv, CATMuS-Print model, Finder Quick Action, monthly updater.
+# Safe to run again over a manual install. It does not delete a working venv
+# or the model. An existing venv that cannot be reused is moved aside first.
+emulate -R zsh
+setopt pipefail nounset extendedglob nullglob
+
+# $0 is the script here. Inside a function, zsh sets $0 to the function name.
+SELF=${0:A}
+BIN_DIR=${SELF:h}
+SHARE=${BIN_DIR:h}/share/ocr-pdf
+VERSION=0.1.0
+if [[ -r "$SHARE/VERSION" ]]; then
+  VERSION=$(<"$SHARE/VERSION")
+  VERSION=${VERSION//[[:space:]]/}
+fi
+
+die() { print -u2 -- "ocr-pdf-setup: $*"; exit 1; }
+
+usage() {
+  cat <<'EOF'
+ocr-pdf-setup — finish installing OCR PDF. Safe to run more than once.
+
+  ocr-pdf-setup
+  ocr-pdf-setup --version
+
+It will:
+  - create or reuse ~/.venvs/kraken on Homebrew python@3.13
+  - install the pinned requirements (an existing venv is snapshotted first)
+  - download CATMuS-Print with `kraken get 10.5281/zenodo.10592716` if missing
+  - install the OCR PDF Quick Action into ~/Library/Services
+  - load the monthly updater (1st of the month, 4:47)
+
+A working venv is not deleted. One that has to be replaced is moved to
+~/.venvs/kraken.backup-<date> and left there.
+EOF
+}
+
+case ${1:-} in
+  "") ;;
+  --version) print -r -- "ocr-pdf-setup $VERSION"; exit 0 ;;
+  --help|-h) usage; exit 0 ;;
+  *) die "unknown option: $1 (try --help)" ;;
+esac
+
+[[ "$(uname -s)" == Darwin ]] || die "ocr-pdf-setup runs on macOS. Install with Homebrew there, then run it."
+
+[[ -f $SHARE/requirements.txt ]] || die "cannot find $SHARE/requirements.txt"
+[[ -d "$SHARE/OCR PDF.workflow" ]] || die "cannot find the Quick Action bundle in $SHARE"
+[[ -f $SHARE/local.kraken.update.plist ]] || die "cannot find the LaunchAgent template in $SHARE"
+
+LOG="$HOME/Library/Logs/ocr_pdf_setup.log"
+mkdir -p "${LOG:h}" || die "cannot create ${LOG:h}"
+exec > >(tee -a "$LOG") 2>&1
+
+log() { print -r -- "$(date '+%Y-%m-%d %H:%M:%S') $*"; }
+
+VENV="${KRAKEN_VENV:-$HOME/.venvs/kraken}"
+REQ="$SHARE/requirements.txt"
+STATE="$HOME/Library/Application Support/pdf_inbox_pipeline"
+SNAPDIR="$STATE/kraken-snapshots"
+PIP_TIMEOUT=3600
+CREATED_NEW=0
+BACKUP_PATH=""
+SNAP=""
+PY=""
+
+case $VENV in
+  "$HOME"|"$HOME/") die "refusing to use your home directory as the venv" ;;
+  "$HOME"/*) ;;
+  *) die "refusing to use a venv outside your home directory: $VENV" ;;
+esac
+
+export PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1 PYTHONUNBUFFERED=1
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/ocr-pdf-setup.XXXXXX") || die "cannot make a temp directory"
+cleanup() {
+  [[ -n ${WORK:-} && -d ${WORK:-} ]] && rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+with_timeout() {
+  local s=$1
+  shift
+  /usr/bin/perl -e 'alarm shift; exec @ARGV or exit 127' "$s" "$@"
+}
+
+pick_python313() {
+  local c brew prefix
+  local -a cands
+  cands=(
+    /opt/homebrew/opt/python@3.13/bin/python3.13
+    /usr/local/opt/python@3.13/bin/python3.13
+  )
+  for brew in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+    [[ -x $brew ]] || continue
+    prefix=$("$brew" --prefix python@3.13 2>/dev/null || true)
+    [[ -n $prefix ]] && cands+=("$prefix/bin/python3.13")
+  done
+  for c in "${cands[@]}"; do
+    [[ -x $c ]] || continue
+    "$c" -c 'import venv, ensurepip' >/dev/null 2>&1 || continue
+    print -r -- "$c"
+    return 0
+  done
+  return 1
+}
+
+stable_cmd() {
+  local name=$1 p
+  local -a cands
+  cands=("/opt/homebrew/bin/$name" "/usr/local/bin/$name" "$BIN_DIR/$name")
+  for p in "${cands[@]}"; do
+    [[ -x $p ]] || continue
+    print -r -- "$p"
+    return 0
+  done
+  return 1
+}
+
+find_model() {
+  local -a m
+  m=("$HOME/Library/Application Support/htrmopo"/*/catmus-print-fondue-large.mlmodel(N))
+  (( ${#m} )) && print -r -- "${m[1]}"
+}
+
+fail_install() {
+  local why=$1
+  log "ERROR: $why"
+  if (( CREATED_NEW )) && [[ -n $BACKUP_PATH && -e $BACKUP_PATH ]]; then
+    log "Putting the previous venv back from $BACKUP_PATH"
+    if rm -rf "$VENV" && mv "$BACKUP_PATH" "$VENV"; then
+      BACKUP_PATH=""
+      die "$why The previous venv has been put back."
+    fi
+    die "$why Could not put the previous venv back. It is still at $BACKUP_PATH."
+  fi
+  if (( CREATED_NEW == 0 )) && [[ -n $SNAP && -f $SNAP && -x $PY ]]; then
+    log "Restoring packages from $SNAP"
+    if with_timeout $PIP_TIMEOUT "$PY" -m pip install -q -r "$SNAP"; then
+      die "$why Packages were restored from $SNAP. The venv directory was not deleted."
+    fi
+    die "$why Package restore failed. Snapshot: $SNAP. The venv was not deleted."
+  fi
+  die "$why Nothing older was deleted. Rerun ocr-pdf-setup to try again."
+}
+
+log "===== ocr-pdf-setup $VERSION ====="
+
+py313=$(pick_python313) || die "Homebrew python@3.13 was not found. Install it with: brew install python@3.13"
+log "Using $py313"
+
+if [[ -e $VENV && ! -f $VENV/pyvenv.cfg && ! -x $VENV/bin/python ]]; then
+  die "$VENV exists but is not a Python virtualenv. Refusing to move or replace it."
+fi
+
+if [[ -x $VENV/bin/python ]] && "$VENV/bin/python" -c 'import sys; raise SystemExit(0 if sys.version_info[:2]==(3, 13) else 2)'; then
+  log "Reusing $VENV ($("$VENV/bin/python" -c 'import sys; print(sys.version.split()[0])'))"
+else
+  if [[ -e $VENV ]]; then
+    BACKUP_PATH="$VENV.backup-$(date '+%Y%m%d-%H%M%S')"
+    log "Moving the existing venv aside to $BACKUP_PATH"
+    mv "$VENV" "$BACKUP_PATH" || die "could not move $VENV aside; it was left untouched"
+  else
+    log "Creating $VENV"
+  fi
+  mkdir -p "${VENV:h}" || die "cannot create ${VENV:h}"
+  if ! "$py313" -m venv "$VENV"; then
+    log "python -m venv failed"
+    # $VENV did not exist when this attempt started (an old one was already moved).
+    rm -rf "$VENV"
+    if [[ -n $BACKUP_PATH && -e $BACKUP_PATH ]]; then
+      mv "$BACKUP_PATH" "$VENV" || log "could not move $BACKUP_PATH back to $VENV"
+      BACKUP_PATH=""
+    fi
+    die "could not create the venv"
+  fi
+  CREATED_NEW=1
+fi
+
+PY="$VENV/bin/python"
+[[ -x $PY ]] || die "venv python is missing at $PY"
+
+if ! "$PY" -m pip --version >/dev/null 2>&1; then
+  "$PY" -m ensurepip --upgrade >/dev/null 2>&1 || die "the venv has no pip and ensurepip failed"
+fi
+
+mkdir -p "$SNAPDIR" || die "cannot create $SNAPDIR"
+SNAP="$SNAPDIR/freeze-$(date '+%Y%m%d-%H%M%S').txt"
+if "$PY" -m pip freeze --exclude-editable >"$WORK/freeze.txt" 2>/dev/null; then
+  {
+    print -r -- "# ocr-pdf-setup before pinned install"
+    cat "$WORK/freeze.txt"
+  } >"$SNAP"
+  log "Saved a package snapshot: $SNAP"
+else
+  log "pip freeze failed; continuing without a package snapshot"
+  SNAP=""
+fi
+
+log "Installing pinned requirements. The first run downloads PyTorch and can take a while."
+if ! "$PY" -m pip install -q --upgrade pip; then
+  fail_install "could not upgrade pip"
+fi
+if ! with_timeout $PIP_TIMEOUT "$PY" -m pip install -r "$REQ"; then
+  fail_install "pip install of the pinned requirements failed or timed out"
+fi
+if ! "$PY" -c 'import kraken, torch, pymupdf, PIL'; then
+  fail_install "the venv cannot import kraken, torch, pymupdf, and Pillow"
+fi
+log "pip check:"
+if ! "$PY" -m pip check; then
+  fail_install "pip check failed"
+fi
+log "venv ready: $("$PY" -c 'import sys; from importlib.metadata import version as v; print("python", sys.version.split()[0], "| kraken", v("kraken"), "| torch", v("torch"), "| pymupdf", v("pymupdf"), "| scipy", v("scipy"))')"
+if [[ -n $BACKUP_PATH ]]; then
+  log "The previous venv was kept at $BACKUP_PATH and was not deleted."
+fi
+
+model=$(find_model || true)
+if [[ -n $model ]]; then
+  log "CATMuS-Print model already present: $model"
+else
+  log "Downloading CATMuS-Print: kraken get 10.5281/zenodo.10592716"
+  if ! "$VENV/bin/kraken" get 10.5281/zenodo.10592716; then
+    die "kraken get failed. The venv was left in place. Rerun ocr-pdf-setup to try the download again."
+  fi
+  model=$(find_model || true)
+  if [[ -z $model ]]; then
+    die "kraken get finished, but catmus-print-fondue-large.mlmodel is not under ~/Library/Application Support/htrmopo. Nothing was deleted."
+  fi
+  log "Model installed: $model"
+fi
+
+src="$SHARE/OCR PDF.workflow"
+dest="$HOME/Library/Services/OCR PDF.workflow"
+bin_path=$(stable_cmd ocr-pdf) || die "cannot find the ocr-pdf command"
+if [[ -L $dest ]]; then
+  die "$dest is a symlink; refusing to replace it"
+fi
+if [[ -e $dest && ! -d $dest ]]; then
+  die "$dest exists and is not a Quick Action folder; refusing to replace it"
+fi
+mkdir -p "$HOME/Library/Services" || die "cannot create ~/Library/Services"
+if [[ -d $dest ]]; then
+  log "Replacing the Quick Action at $dest"
+fi
+rm -rf "$dest"
+cp -R "$src" "$dest" || die "could not copy the Quick Action"
+"$PY" - "$dest/Contents/document.wflow" "$bin_path" <<'PY' || die "could not point the Quick Action at the installed command"
+import plistlib, sys
+wflow, bin_path = sys.argv[1:]
+if any(ch in bin_path for ch in "&<>"):
+    raise SystemExit("refusing a command path with XML special characters")
+raw = open(wflow, "rb").read()
+old = b"/opt/homebrew/bin/ocr-pdf"
+if old not in raw:
+    raise SystemExit("Quick Action does not contain /opt/homebrew/bin/ocr-pdf")
+raw = raw.replace(old, bin_path.encode(), 1)
+open(wflow, "wb").write(raw)
+params = plistlib.loads(raw)["actions"][0]["action"]["ActionParameters"]
+cmd = params["COMMAND_STRING"]
+if not cmd.startswith("MODE=spectre "):
+    raise SystemExit("MODE=spectre is missing from the Quick Action")
+if bin_path not in cmd or '"$@"' not in cmd:
+    raise SystemExit("Quick Action command line is incomplete")
+if params.get("shell") != "/bin/zsh" or params.get("inputMethod") != 1:
+    raise SystemExit("Quick Action shell settings changed")
+PY
+log "Quick Action installed. It runs: MODE=spectre \"$bin_path\" \"\$@\""
+
+upd=$(stable_cmd ocr-pdf-update) || die "cannot find ocr-pdf-update"
+agent_dest="$HOME/Library/LaunchAgents/local.kraken.update.plist"
+mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs" || die "cannot create LaunchAgents or Logs"
+"$PY" - "$SHARE/local.kraken.update.plist" "$WORK/agent.plist" "$upd" "$HOME" <<'PY' || die "could not fill in the LaunchAgent"
+import plistlib, sys
+tmpl, dest, update, home = sys.argv[1:]
+for label, value in (("#OCR_PDF_UPDATE#", update), ("#HOME#", home)):
+    if label in value or any(ch in value for ch in "&<>"):
+        raise SystemExit(f"refusing to substitute {value!r}")
+text = open(tmpl, encoding="utf-8").read()
+if "#OCR_PDF_UPDATE#" not in text or "#HOME#" not in text:
+    raise SystemExit("LaunchAgent template is missing a placeholder")
+text = text.replace("#OCR_PDF_UPDATE#", update).replace("#HOME#", home)
+if "#OCR_PDF_UPDATE#" in text or "#HOME#" in text:
+    raise SystemExit("a placeholder was left in the LaunchAgent")
+open(dest, "w", encoding="utf-8").write(text)
+p = plistlib.load(open(dest, "rb"))
+if p.get("Label") != "local.kraken.update":
+    raise SystemExit("unexpected LaunchAgent label")
+if p.get("ProgramArguments") != ["/bin/zsh", update]:
+    raise SystemExit("unexpected LaunchAgent program")
+if p.get("StartCalendarInterval") != {"Day": 1, "Hour": 4, "Minute": 47}:
+    raise SystemExit("unexpected LaunchAgent schedule")
+if p.get("RunAtLoad") is not False:
+    raise SystemExit("RunAtLoad should be false")
+log_path = home + "/Library/Logs/kraken_update.launchd.log"
+for key in ("StandardOutPath", "StandardErrorPath"):
+    if p.get(key) != log_path:
+        raise SystemExit(f"unexpected {key}")
+PY
+uid=$(id -u)
+domain="gui/$uid"
+if [[ -f $agent_dest ]]; then
+  launchctl bootout "$domain" "$agent_dest" >/dev/null 2>&1 || true
+fi
+cp "$WORK/agent.plist" "$agent_dest" || die "could not install $agent_dest"
+chmod 644 "$agent_dest"
+if ! launchctl bootstrap "$domain" "$agent_dest"; then
+  die "launchctl bootstrap failed. The plist is installed at $agent_dest. Rerun ocr-pdf-setup after you are logged in to the graphical session."
+fi
+log "LaunchAgent loaded: $agent_dest (day 1, 04:47)"
+
+if [[ -x /System/Library/CoreServices/pbs ]]; then
+  if ! /System/Library/CoreServices/pbs -update; then
+    die "pbs -update failed. The Quick Action is installed; Finder may not show it until you log out and back in."
+  fi
+else
+  log "pbs was not found. Log out and back in so Finder shows the Quick Action."
+fi
+
+print -r -- ""
+print -r -- "OCR PDF is ready."
+print -r -- "In Finder: right-click a scanned PDF, then Quick Actions, then OCR PDF."
+print -r -- "Pipeline log: ~/Library/Logs/pdf_inbox_pipeline.log"
+print -r -- "Setup log: $LOG"
+if [[ -n $BACKUP_PATH ]]; then
+  print -r -- "Previous venv kept at: $BACKUP_PATH"
+fi
+exit 0

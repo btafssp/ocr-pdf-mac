@@ -1,0 +1,10 @@
+# macOS clutter, editor backups, and generated PDFs (never commit a scan)
+.DS_Store
+._*
+*.bak
+*.bak-*
+*~
+*.pdf
+__pycache__/
+*.pyc
+.venv/
