@@ -9,17 +9,17 @@ class OcrPdf < Formula
   desc "OCR scanned PDFs from Finder with Kraken"
   homepage "https://github.com/btafssp/ocr-pdf-mac"
   url "https://github.com/btafssp/ocr-pdf-mac/archive/refs/tags/v0.1.0.tar.gz"
-  version "0.1.0"
   # TODO: replace this placeholder with the v0.1.0 release tarball sha256.
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "GPL-3.0-only"
 
-  depends_on arch: :arm64
-  depends_on :macos
   depends_on "ghostscript"
   depends_on "ocrmypdf"
   depends_on "python@3.13"
   depends_on "unpaper"
+
+  depends_on :macos
+  depends_on arch: :arm64
 
   def install
     bin.install "bin/ocr-pdf"
@@ -49,8 +49,8 @@ class OcrPdf < Formula
   test do
     assert_match "0.1.0", shell_output("#{bin}/ocr-pdf --version")
     assert_match "0.1.0", shell_output("#{bin}/ocr-pdf-setup --version")
-    assert_predicate pkgshare/"requirements.txt", :exist?
-    assert_predicate pkgshare/"make-smoke-pdf.py", :exist?
-    assert_predicate (pkgshare/"OCR PDF.workflow/Contents/document.wflow"), :exist?
+    assert_path_exists pkgshare/"requirements.txt"
+    assert_path_exists pkgshare/"make-smoke-pdf.py"
+    assert_path_exists pkgshare/"OCR PDF.workflow/Contents/document.wflow"
   end
 end

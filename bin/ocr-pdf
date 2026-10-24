@@ -281,7 +281,7 @@ elif mode == "dither":
 elif mode == "spectre":
     # Spectre-like B&W: autocontrast, Otsu threshold (+12 so thin type stays
     # black), morphological open/close. No illumination flattening (it washed
-    # out thin Rota type).
+    # out thin, small type).
     im = ImageOps.autocontrast(im, cutoff=0.2)
     hist = im.histogram(); total = sum(hist) or 1
     sum1 = sum(i * h for i, h in enumerate(hist))
@@ -534,6 +534,11 @@ process_one() {
         segment -bl ocr -m "$MODEL" </dev/null >>"$WORK/kraken-retry.log" 2>&1
     done
     missing=(); for g in $grays; do [[ -s "$WORK/alto/${${g:t}:r}.xml" ]] || missing+=${g:t:r}; done
+    if (( ${#missing} && ${#missing} == ${#grays} )); then
+      log "ERROR: Kraken produced no text on any of ${#grays} page(s) (rc=$rc)"
+      alert "OCR PDF: failed" "Kraken produced no text for $BASE. Nothing was saved. See $LOG"
+      return 1
+    fi
     (( ${#missing} )) && log "WARNING: no text for ${#missing} page(s): ${missing}"
   fi
   log "Kraken done ($(elapsed $((EPOCHSECONDS - t0))))"
@@ -559,6 +564,11 @@ process_one() {
   read vp vchars vempty <<<"$("$PY" "$WORK/verify.py" "$final" 2>>"$LOG")"
   if [[ "$vp" != "$npages" ]]; then
     alert "OCR PDF: failed" "Output has ${vp:-?} pages but $npages were expected. Nothing was saved."; return 1
+  fi
+  if (( ${vchars:-0} == 0 )); then
+    log "ERROR: Kraken produced no text for $BASE"
+    alert "OCR PDF: failed" "Kraken produced no text for $BASE. Nothing was saved. See $LOG"
+    return 1
   fi
   mv -f "$final" "$out" || { alert "OCR PDF: failed" "Could not write $out"; return 1; }
   if [[ "$KEEP_ALTO" == 1 ]]; then rm -rf "${out%.pdf}_alto"; cp -R "$WORK/alto" "${out%.pdf}_alto"; fi

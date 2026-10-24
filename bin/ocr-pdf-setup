@@ -32,6 +32,7 @@ It will:
   - download CATMuS-Print with `kraken get 10.5281/zenodo.10592716` if missing
   - install the OCR PDF Quick Action into ~/Library/Services
   - load the monthly updater (1st of the month, 4:47)
+  - OCR a one-page public-domain test, and stop if that fails
 
 A working venv is not deleted. One that has to be replaced is moved to
 ~/.venvs/kraken.backup-<date> and left there.
@@ -205,15 +206,33 @@ log "Installing pinned requirements. The first run downloads PyTorch and can tak
 if ! "$PY" -m pip install -q --upgrade pip; then
   fail_install "could not upgrade pip"
 fi
+# A fresh resolver refuses kraken==7.1.1 together with scipy==1.16.3, because
+# kraken's metadata says scipy~=1.15.3. 1.16.3 is the wheel that loads. If the
+# resolver refuses, install the pinned file as written.
 if ! with_timeout $PIP_TIMEOUT "$PY" -m pip install -r "$REQ"; then
-  fail_install "pip install of the pinned requirements failed or timed out"
+  log "Resolver rejected the pins. Installing them without re-resolving dependencies."
+  if ! with_timeout $PIP_TIMEOUT "$PY" -m pip install --no-deps -r "$REQ"; then
+    fail_install "pip install of the pinned requirements failed or timed out"
+  fi
 fi
-if ! "$PY" -c 'import kraken, torch, pymupdf, PIL'; then
-  fail_install "the venv cannot import kraken, torch, pymupdf, and Pillow"
+if ! "$PY" -c 'import kraken, torch, pymupdf, PIL, scipy.sparse.linalg'; then
+  fail_install "the venv cannot import kraken, torch, pymupdf, Pillow, or scipy.sparse.linalg"
 fi
-log "pip check:"
-if ! "$PY" -m pip check; then
-  fail_install "pip check failed"
+# kraken 7.1.1 wants scipy~=1.15.3. That wheel does not load on macOS 27;
+# scipy 1.16.3 does. pip check will complain. That complaint, and any other
+# pip check line, does not fail setup. The import above and the smoke test do.
+pip_out=$("$PY" -m pip check 2>&1 || true)
+if [[ -z $pip_out ]]; then
+  log "pip check: ok"
+else
+  log "pip check:"
+  print -r -- "$pip_out" | sed 's/^/    /'
+  pip_other=$(print -r -- "$pip_out" | grep -v 'scipy~=1\.15\.3' || true)
+  if [[ -z $pip_other ]]; then
+    log "Ignoring the known pip check complaint: kraken wants scipy~=1.15.3; this Mac uses scipy 1.16.3."
+  else
+    log "WARNING: pip check reported more than kraken's scipy pin. Setup continues; the smoke test decides."
+  fi
 fi
 log "venv ready: $("$PY" -c 'import sys; from importlib.metadata import version as v; print("python", sys.version.split()[0], "| kraken", v("kraken"), "| torch", v("torch"), "| pymupdf", v("pymupdf"), "| scipy", v("scipy"))')"
 if [[ -n $BACKUP_PATH ]]; then
@@ -321,6 +340,12 @@ if [[ -x /System/Library/CoreServices/pbs ]]; then
 else
   log "pbs was not found. Log out and back in so Finder shows the Quick Action."
 fi
+
+log "Running the smoke test (one public-domain page). Details: ~/Library/Logs/kraken_update.log"
+if ! "$upd" --smoke-only; then
+  die "Smoke test failed. OCR is not working. See ~/Library/Logs/kraken_update.log. Nothing was deleted; fix the problem and rerun ocr-pdf-setup."
+fi
+log "Smoke test passed."
 
 print -r -- ""
 print -r -- "OCR PDF is ready."

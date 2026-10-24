@@ -15,7 +15,7 @@ brew install btafssp/verbamac/ocr-pdf
 ocr-pdf-setup
 ```
 
-`ocr-pdf-setup` is safe to run again. It reuses `~/.venvs/kraken` when that environment already runs on Homebrew Python 3.13. It does not delete a working environment. If it has to replace one, it moves the old one to `~/.venvs/kraken.backup-<date>` and leaves it there.
+`ocr-pdf-setup` is safe to run again. It reuses `~/.venvs/kraken` when that environment already runs on Homebrew Python 3.13. It does not delete a working environment. If it has to replace one, it moves the old one to `~/.venvs/kraken.backup-<date>` and leaves it there. At the end it OCRs a one-page public-domain test and stops if that fails.
 
 The first setup downloads PyTorch into that virtualenv, so it needs a network connection and a few gigabytes of disk.
 

@@ -1,10 +1,12 @@
 # Pinned Python packages for ~/.venvs/kraken on Homebrew python@3.13.
 # Taken from a known-good freeze on 2026-10-24
-# (python 3.13.17, kraken 7.1.1, torch 2.14.0, pymupdf 1.28.2),
-# with one change: scipy is pinned to 1.15.3.
-# The freeze had scipy==1.16.3. `pip check` reports that kraken 7.1.1
-# requires scipy~=1.15.3 (at least 1.15.3 and below 1.16).
-# scipy 1.15.3 accepts numpy>=1.23.5,<2.5, so numpy==2.4.6 still fits.
+# (python 3.13.17, kraken 7.1.1, torch 2.14.0, pymupdf 1.28.2, scipy 1.16.3).
+#
+# kraken 7.1.1 declares scipy~=1.15.3. The 1.15.3 macOS arm64 wheel installs
+# on macOS 27 but its extensions do not load (dlopen of _spropack fails),
+# and Kraken then returns no text. scipy 1.16.3 is the build that works.
+# `pip check` reports that one conflict. Setup records it and continues.
+# The monthly updater is constrained to scipy>=1.16 so it cannot downgrade.
 #
 # Apple Silicon macOS only. ocr-pdf-setup installs this with pip.
 # There are 72 packages.
@@ -66,7 +68,7 @@ rpds-py==2026.9.1
 safetensors==0.7.0
 scikit-image==0.25.2
 scikit-learn==1.7.2
-scipy==1.15.3
+scipy==1.16.3
 setuptools==84.0.0
 shapely==2.1.2
 Sickle==0.7.0
