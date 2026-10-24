@@ -11,7 +11,7 @@ Copyright (C) 2026 Brian T. Austin. Licensed under the GNU General Public Licens
 On an Apple Silicon Mac, with [Homebrew](https://brew.sh):
 
 ```sh
-brew install btafssp/verbamac/ocr-pdf
+brew install btafssp/tap/ocr-pdf
 ocr-pdf-setup
 ```
 
@@ -19,7 +19,7 @@ ocr-pdf-setup
 
 The first setup downloads PyTorch into that virtualenv, so it needs a network connection and a few gigabytes of disk.
 
-The formula in this repository is [packaging/homebrew/ocr-pdf.rb](packaging/homebrew/ocr-pdf.rb). It is the file to add to the tap `btafssp/homebrew-verbamac` as `Formula/ocr-pdf.rb`. Until that is done, and until a `v0.1.0` release tarball exists, the `brew install` line above will not work. The formula's version and sha256 are placeholders. See [Releasing](#releasing).
+The formula lives in the tap [btafssp/homebrew-tap](https://github.com/btafssp/homebrew-tap) as `Formula/ocr-pdf.rb`. Daily `brew upgrade` picks up new releases. [packaging/homebrew/ocr-pdf.rb](packaging/homebrew/ocr-pdf.rb) is the copy kept in this repository.
 
 ## Use
 
@@ -83,10 +83,10 @@ Ghostscript and unpaper do the page image. The invisible-text font `pdf.ttf`, if
 
 ## Releasing
 
-Do not publish the formula while its sha256 is all zeros. After review:
+To release a new version:
 
-1. Tag `v0.1.0` and publish the GitHub release. The formula URL is the tag archive `v0.1.0.tar.gz`.
+1. Tag `vX.Y.Z` and publish the GitHub release. The formula URL is the tag archive `vX.Y.Z.tar.gz`.
 2. Set `sha256` in `packaging/homebrew/ocr-pdf.rb` from `shasum -a 256` of that tarball.
-3. Copy the formula to `btafssp/homebrew-verbamac` as `Formula/ocr-pdf.rb`.
+3. Copy the formula to `btafssp/homebrew-tap` as `Formula/ocr-pdf.rb`.
 
 Keep `share/ocr-pdf/VERSION`, the `0.1.0` fallback in the scripts, and the formula version the same.

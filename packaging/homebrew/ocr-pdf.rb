@@ -1,16 +1,8 @@
-# Review copy for btafssp/homebrew-verbamac, to be added later as Formula/ocr-pdf.rb.
-# Version 0.1.0 is a placeholder. There is no release tarball yet.
-# TODO: replace the all-zero sha256 below with the sha256 of the v0.1.0
-# GitHub release tarball before copying this file into the tap:
-#   shasum -a 256 v0.1.0.tar.gz
-# `brew audit` will reject the zero hash. That is intentional until the
-# real tarball exists. Do not tag or publish a release from this change.
 class OcrPdf < Formula
   desc "OCR scanned PDFs from Finder with Kraken"
   homepage "https://github.com/btafssp/ocr-pdf-mac"
   url "https://github.com/btafssp/ocr-pdf-mac/archive/refs/tags/v0.1.0.tar.gz"
-  # TODO: replace this placeholder with the v0.1.0 release tarball sha256.
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "c421a0b5ebfa5f837476f8081c78e9e88afbbf97ecd978f76aeaf5d1fe297673"
   license "GPL-3.0-only"
 
   depends_on arch: :arm64
