@@ -206,14 +206,13 @@ log "Installing pinned requirements. The first run downloads PyTorch and can tak
 if ! "$PY" -m pip install -q --upgrade pip; then
   fail_install "could not upgrade pip"
 fi
-# A fresh resolver refuses kraken==7.1.1 together with scipy==1.16.3, because
-# kraken's metadata says scipy~=1.15.3. 1.16.3 is the wheel that loads. If the
-# resolver refuses, install the pinned file as written.
-if ! with_timeout $PIP_TIMEOUT "$PY" -m pip install -r "$REQ"; then
-  log "Resolver rejected the pins. Installing them without re-resolving dependencies."
-  if ! with_timeout $PIP_TIMEOUT "$PY" -m pip install --no-deps -r "$REQ"; then
-    fail_install "pip install of the pinned requirements failed or timed out"
-  fi
+# requirements.txt is a complete pin list. Installing it with the resolver
+# prints ResolutionImpossible, because kraken 7.1.1 asks for scipy~=1.15.3
+# and this Mac needs scipy 1.16.3. Install the pins as written. The import
+# check and the smoke test decide whether the result works.
+log "Installing the pinned packages without re-resolving dependencies."
+if ! with_timeout $PIP_TIMEOUT "$PY" -m pip install --no-deps -r "$REQ"; then
+  fail_install "pip install of the pinned requirements failed or timed out"
 fi
 if ! "$PY" -c 'import kraken, torch, pymupdf, PIL, scipy.sparse.linalg'; then
   fail_install "the venv cannot import kraken, torch, pymupdf, Pillow, or scipy.sparse.linalg"

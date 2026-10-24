@@ -13,13 +13,12 @@ class OcrPdf < Formula
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "GPL-3.0-only"
 
+  depends_on arch: :arm64
   depends_on "ghostscript"
+  depends_on :macos
   depends_on "ocrmypdf"
   depends_on "python@3.13"
   depends_on "unpaper"
-
-  depends_on :macos
-  depends_on arch: :arm64
 
   def install
     bin.install "bin/ocr-pdf"

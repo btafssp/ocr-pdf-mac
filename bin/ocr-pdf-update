@@ -16,6 +16,7 @@
 #      (~/Library/Application Support/htrmopo) and is never touched.
 #   2. Snapshot: save `pip freeze` as a rollback point (last 12 kept).
 #   3. Upgrade: pip install --upgrade kraken, constrained to pymupdf<2 and scipy>=1.16.
+#      If no release can satisfy scipy>=1.16, say so and stop. No notification.
 #   4. Smoke test: build a one-page image-only PDF of public-domain text and
 #      run ocr-pdf headless (NO_UI=1 OCR_LANGS=lat MODE=spectre). Check that
 #      real text comes out. No scanned book is used.
@@ -160,10 +161,9 @@ rebuild_venv() {
   req="$SHARE/requirements.txt"
   # kraken 7.1.1's metadata rejects scipy>=1.16. Install the pinned file anyway.
   install_pinned() {
-    local file=$1
-    pip install -r "$file" && return 0
-    log "could not resolve $file; installing it without re-resolving dependencies"
-    pip install --no-deps -r "$file"
+    # A freeze lists every package. The resolver rejects kraken 7.1.1 with
+    # scipy 1.16.3, so install the file as written.
+    pip install --no-deps -r "$1"
   }
   if "$py" -m venv "$VENV" && pip install -q --upgrade pip &&
      { { [[ -n $snap ]] && install_pinned "$snap"; } ||
@@ -253,16 +253,24 @@ print -l 'pymupdf<2' 'scipy>=1.16' > "$WORK/constraints.txt"
 CHANGED=0
 if (( DRY_RUN )); then
   log "dry run: pip install --upgrade --dry-run kraken -c constraints (pymupdf<2, scipy>=1.16)"
-  pip install --upgrade --dry-run kraken -c "$WORK/constraints.txt" 2>&1 \
-    | grep -vE '^(Requirement already satisfied|Collecting|Using cached|Downloading)' | sed 's/^/    /'
-  PIP_RC=${pipestatus[1]}
-  log "dry run: pip exit $PIP_RC; nothing changed"
+  pip install --upgrade --dry-run kraken -c "$WORK/constraints.txt" >"$WORK/pip-upgrade.log" 2>&1
+  PIP_RC=$?
+  if grep -q ResolutionImpossible "$WORK/pip-upgrade.log"; then
+    log "no kraken release is compatible with scipy>=1.16 yet; nothing changed"
+  else
+    grep -vE '^(Requirement already satisfied|Collecting|Using cached|Downloading)' "$WORK/pip-upgrade.log" | sed 's/^/    /' || true
+    log "dry run: pip exit $PIP_RC; nothing changed"
+  fi
 else
   log "pip install --upgrade kraken (constraints pymupdf<2, scipy>=1.16)"
-  pip install --upgrade kraken -c "$WORK/constraints.txt" 2>&1 \
-    | grep -v '^Requirement already satisfied' | sed 's/^/    /'
-  PIP_RC=${pipestatus[1]}
+  pip install --upgrade kraken -c "$WORK/constraints.txt" >"$WORK/pip-upgrade.log" 2>&1
+  PIP_RC=$?
   cmp -s <("$PY" -m pip freeze --exclude-editable 2>/dev/null) <(grep -v '^#' "$SNAP") || CHANGED=1
+  if grep -q ResolutionImpossible "$WORK/pip-upgrade.log" && (( CHANGED == 0 )); then
+    log "no kraken release is compatible with scipy>=1.16 yet; nothing changed"
+    exit 0
+  fi
+  grep -v '^Requirement already satisfied' "$WORK/pip-upgrade.log" | sed 's/^/    /' || true
   log "pip exit $PIP_RC; packages changed: $CHANGED"
   (( PIP_RC != 0 && CHANGED == 0 )) && log "upgrade failed without changing anything (offline?); testing current install"
 fi
