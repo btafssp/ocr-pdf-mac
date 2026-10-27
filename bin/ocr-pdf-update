@@ -34,7 +34,7 @@ export PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1
 
 # Top-level only. Inside a function, zsh sets $0 to the function name.
 SHARE="${0:A:h:h}/share/ocr-pdf"
-VERSION=0.1.1
+VERSION=0.2.0
 if [[ -r "$SHARE/VERSION" ]]; then
   VERSION=$(<"$SHARE/VERSION")
   VERSION=${VERSION//[[:space:]]/}

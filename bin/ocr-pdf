@@ -18,7 +18,10 @@
 #   2. per sheet, in parallel (all cores):
 #        Ghostscript rasterize at $DPI grayscale
 #        -> unpaper (split 2-up spreads, deskew, despeckle, black filter)
+#           (skipped for MODE=graywhite: unpaper recrops and shifts the page)
 #        -> Pillow: cleaned grayscale copy for Kraken + final image per $MODE
+#           (graywhite: Kraken reads the plain grey render; the page image
+#           is cleaned separately)
 #   3. Kraken (CATMuS-Print) segment -bl + ocr -> one ALTO file per page,
 #      several Kraken workers in parallel, with a stall watchdog
 #   4. PyMuPDF: page image + Kraken words as an invisible text layer
@@ -38,8 +41,14 @@
 #   Automator:  MODE=spectre "/opt/homebrew/bin/ocr-pdf" "$@"
 #
 # Environment:
-#   MODE=bw|dither|gray|spectre  default bw; spectre = 300 dpi Otsu B&W, TIFF
-#   DPI=250                      raster dpi (spectre: SPECTRE_DPI, default 300)
+#   MODE=bw|dither|gray|spectre|graywhite
+#                                default bw
+#                                spectre = 300 dpi Otsu B&W, TIFF, then JBIG2
+#                                graywhite = white paper, grey type, greyscale
+#                                JPEG. Unpaper is skipped. Kraken reads the
+#                                plain grey render.
+#   DPI=250                      raster dpi (spectre: SPECTRE_DPI, default 300;
+#                                graywhite uses DPI, default 250)
 #   SPLIT=auto|always|never      auto: page wider than 1.25:1 = 2-up spread
 #   BLACKFILTER=on|off           unpaper black-border filter (off for faint print)
 #   OCR_LANGS=lat+ita            skip the picker (languages only name the file;
@@ -53,7 +62,8 @@
 #   KRAKEN_JOBS=N                parallel Kraken workers (default: min(cores/2, RAM GB/5, 4))
 #   PAGE_TIMEOUT=240             seconds without progress before giving up
 #   NO_UI=1                      no notifications / dialogs (testing, Terminal)
-#   JPEG_QUALITY=32  BW_THRESHOLD=165
+#   JPEG_QUALITY=32              gray JPEG and ocrmypdf (graywhite default: 65)
+#   BW_THRESHOLD=165
 # =============================================================================
 
 emulate -R zsh
@@ -77,7 +87,7 @@ SELF="${0:A}"
 LOG="$HOME/Library/Logs/pdf_inbox_pipeline.log"
 STATE_DIR="$HOME/Library/Application Support/pdf_inbox_pipeline"
 # Keep this fallback in step with share/ocr-pdf/VERSION.
-VERSION=0.1.1
+VERSION=0.2.0
 _verfile="${SELF:h:h}/share/ocr-pdf/VERSION"
 if [[ -r $_verfile ]]; then
   VERSION=$(<"$_verfile")
@@ -132,7 +142,13 @@ KEEP_ALTO="${KEEP_ALTO:-0}"
 OUTPUT_TYPE="${OUTPUT_TYPE:-pdf}"
 FORCE="${FORCE:-0}"
 NO_UI="${NO_UI:-0}"
-JPEG_QUALITY="${JPEG_QUALITY:-32}"
+# graywhite's tested page image is a greyscale JPEG at quality 65. An explicit
+# JPEG_QUALITY still wins, the same way the other modes take their settings.
+if [[ "$MODE" == graywhite ]]; then
+  JPEG_QUALITY="${JPEG_QUALITY:-65}"
+else
+  JPEG_QUALITY="${JPEG_QUALITY:-32}"
+fi
 BW_THRESHOLD="${BW_THRESHOLD:-165}"
 KRAKEN_DEVICE="${KRAKEN_DEVICE:-cpu}"
 KRAKEN_MODEL="${KRAKEN_MODEL:-}"
@@ -205,6 +221,17 @@ if [[ "${1:-}" == __sheet ]]; then
   with_timeout 180 $GS -dSAFER -dBATCH -dNOPAUSE -dQUIET -sDEVICE=pnggray \
       -r"$DPI" -dFirstPage=$n -dLastPage=$n -o "$tmp/sheet.png" "$IN_PDF" </dev/null \
     || fail "Ghostscript failed or timed out rendering page $n"
+
+  # graywhite: do not run unpaper. Its mask and border steps recrop and shift
+  # the page. Kraken reads this plain grey render; the cleaned image OCRs worse.
+  if [[ "$MODE" == graywhite ]]; then
+    with_timeout 180 "$PY" "$WORK/topage.py" "$tmp/sheet.png" "$WORK/pages/$tag-1" \
+        "$WORK/gray/$tag-1.png" "$MODE" "$BW_THRESHOLD" "$JPEG_QUALITY" "$DPI" </dev/null \
+      || fail "image cleanup (Pillow) failed on page $n"
+    rm -rf "$tmp"
+    : >"$WORK/done/$tag"
+    exit 0
+  fi
 
   # 2-up spread?
   split=0
@@ -300,6 +327,23 @@ elif mode == "spectre":
     bw = im.point(lambda p: 255 if p > cut else 0)
     bw = bw.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.MaxFilter(3))
     bw.convert("1").save(dst + ".tif", "TIFF", compression="tiff_lzw", dpi=res)
+elif mode == "graywhite":
+    # White paper, grey type, light seal. Kraken already has the uncleaned
+    # grey saved above. Flatten illumination, push paper to white, keep type
+    # grey, then a light soften. WHITE=0.92 BLACK=0.25 GAMMA=1 BLUR=0.6.
+    import numpy as np
+    a = np.asarray(im, np.float32)
+    f = max(1, dpi // 40)  # 250 dpi -> one sixth
+    sw, sh = max(1, im.width // f), max(1, im.height // f)
+    bg_im = im.resize((sw, sh), Image.BILINEAR)
+    if sw >= 7 and sh >= 7:
+        bg_im = bg_im.filter(ImageFilter.MaxFilter(7))
+    bg_im = bg_im.filter(ImageFilter.GaussianBlur(10))
+    bg = np.asarray(bg_im.resize(im.size, Image.BILINEAR), np.float32)
+    r = np.clip(a / np.maximum(bg, 1), 0, 1.5)
+    t = np.clip((r - 0.25) / (0.92 - 0.25), 0, 1) ** 1.0
+    out = Image.fromarray((t * 255 + 0.5).astype(np.uint8)).filter(ImageFilter.GaussianBlur(0.6))
+    out.save(dst + ".jpg", "JPEG", quality=q, optimize=True, dpi=res)
 else:  # bw
     im = ImageOps.autocontrast(im, cutoff=1).filter(ImageFilter.MedianFilter(3))
     im.point(lambda p: 255 if p > thr else 0).convert("1").save(dst + ".png", "PNG", optimize=True, dpi=res)
@@ -345,7 +389,16 @@ for img in imgs:
             tw.append(pymupdf.Point(x0 + (bx - x0) / sx, base.y),
                       t + (" " if i < len(texts) - 1 else ""), font=font, fontsize=size)
         tw.write_text(page, render_mode=3, morph=(base, pymupdf.Matrix(sx, 1)))
-doc.save(out, garbage=3, deflate=True)
+# The glyphless font has no real outlines, so PyMuPDF falls back to a system
+# face and embeds the whole file. With Noto Serif that is about 186 KB,
+# unsubset. Subset to the characters actually used. This does not rewrite
+# page text, so the words stay where they were. MuPDF's own subsetter is
+# used; fontTools is not required. garbage=4 drops the full face afterwards.
+try:
+    doc.subset_fonts()
+except Exception as exc:
+    print(f"font subset skipped: {exc}", file=sys.stderr)
+doc.save(out, garbage=4, deflate=True, deflate_fonts=True)
 print(len(imgs))
 PY
 
@@ -356,6 +409,35 @@ d = pymupdf.open(sys.argv[1])
 chars = sum(len(p.get_text().strip()) for p in d)
 empty = sum(1 for p in d if len(p.get_text().strip()) < 20)
 print(d.page_count, chars, empty)
+PY
+
+# --- subsetfont.py: shrink the text-layer font, keep every word put --------
+# ocrmypdf --output-type pdf does not subset. A PDF/A Ghostscript pass can
+# also substitute a full face. Run this on the file we are about to keep.
+cat >"$WORK/subsetfont.py" <<'PY'
+import os, sys
+import pymupdf
+path = sys.argv[1]
+doc = pymupdf.open(path)
+before_words = [page.get_text("words") for page in doc]
+before_text = [page.get_text() for page in doc]
+try:
+    doc.subset_fonts()
+except Exception as exc:
+    print(f"font subset skipped: {exc}", file=sys.stderr)
+    sys.exit(0)
+tmp = path + ".subset"
+doc.save(tmp, garbage=4, deflate=True, deflate_fonts=True)
+doc.close()
+check = pymupdf.open(tmp)
+after_words = [page.get_text("words") for page in check]
+after_text = [page.get_text() for page in check]
+check.close()
+if after_text != before_text or after_words != before_words:
+    os.remove(tmp)
+    print("font subset skipped: text or positions changed", file=sys.stderr)
+    sys.exit(0)
+os.replace(tmp, path)
 PY
 }
 
@@ -471,7 +553,7 @@ process_one() {
   BASE="${pdf:t}"
   [[ -f "$pdf" ]] || { alert "OCR PDF" "File not found: $pdf"; return 1; }
   [[ "${pdf:l}" == *.pdf ]] || { alert "OCR PDF" "Not a PDF: $BASE"; return 1; }
-  log "=== $pdf  (MODE=$MODE DPI=$DPI SPLIT=$SPLIT BLACKFILTER=$BLACKFILTER)"
+  log "=== $pdf  (MODE=$MODE DPI=$DPI SPLIT=$SPLIT BLACKFILTER=$BLACKFILTER JPEG_QUALITY=$JPEG_QUALITY)"
 
   # private temp dir; removed on any exit (this function runs in a subshell)
   WORK=$(mktemp -d "${TMPDIR:-/tmp}/pdf_ocr.XXXXXX") || { alert "OCR PDF" "Cannot create temp dir"; return 1; }
@@ -567,6 +649,12 @@ process_one() {
     final="$WORK/layered.pdf"
   fi
 
+  # Subset again after ocrmypdf. Optimize leaves an already-subset font alone.
+  # PDF/A may swap in another full face; this pass reduces that one too.
+  if ! "$PY" "$WORK/subsetfont.py" "$final" >>"$LOG" 2>&1; then
+    log "WARNING: font subset failed; keeping the text font as it is"
+  fi
+
   # --- 6. verify + move into place ---
   local vp vchars vempty half_empty=0
   read vp vchars vempty <<<"$("$PY" "$WORK/verify.py" "$final" 2>>"$LOG")"
@@ -601,10 +689,28 @@ process_one() {
 # =============================================================================
 # main
 # =============================================================================
+usage() {
+  print -u2 -- "Usage: ${SELF:t} [--version] [--no-blackfilter] [--keep-alto] [--force] file.pdf ...
+
+MODE=bw|dither|gray|spectre|graywhite   (default bw)
+  bw         black and white PNG. BW_THRESHOLD is the cutoff (default 165).
+  dither     Floyd-Steinberg black and white PNG.
+  gray       greyscale JPEG. JPEG_QUALITY (default 32).
+  spectre    300 dpi Otsu black and white TIFF, then JBIG2. DPI comes from
+             SPECTRE_DPI (default 300), not from DPI.
+  graywhite  greyscale JPEG, white paper and grey type. DPI (default 250)
+             and JPEG_QUALITY (default 65). Unpaper is skipped. Kraken reads
+             the plain grey render.
+
+DPI sets the raster resolution, except in spectre mode.
+OCR_LANGS=lat+ita skips the language dialog. FORCE=1 OCRs a PDF that already
+has real text. NO_UI=1 turns alerts off."
+}
+
 while [[ $# -gt 0 && "$1" == --* ]]; do
   case "$1" in
     --version)        print -r -- "ocr-pdf $VERSION"; exit 0 ;;
-    --help)           print -u2 "Usage: ${SELF:t} [--version] [--no-blackfilter] [--keep-alto] [--force] file.pdf ..."; exit 0 ;;
+    --help)           usage; exit 0 ;;
     --no-blackfilter) BLACKFILTER=off ;;
     --blackfilter)    BLACKFILTER=on ;;
     --keep-alto)      KEEP_ALTO=1 ;;
@@ -616,7 +722,7 @@ while [[ $# -gt 0 && "$1" == --* ]]; do
   shift
 done
 if (( $# == 0 )); then
-  print -u2 "Usage: ${SELF:t} [--version] [--no-blackfilter] [--keep-alto] [--force] file.pdf ..."
+  usage
   exit 2
 fi
 
@@ -626,6 +732,10 @@ for tool in $GS $UNPAPER $OCRMYPDF $PY $KRAKEN; do
 done
 "$PY" -c 'import PIL, pymupdf' 2>/dev/null \
   || { alert "OCR PDF: missing Python module" "$PY needs Pillow and PyMuPDF:  $PY -m pip install pillow pymupdf"; exit 1; }
+if [[ "$MODE" == graywhite ]]; then
+  "$PY" -c 'import numpy' 2>/dev/null \
+    || { alert "OCR PDF: missing Python module" "$PY needs numpy for MODE=graywhite. It ships in the Kraken venv."; exit 1; }
+fi
 
 # Stop button in the menu bar / Ctrl-C: take the running file's subshell down too.
 trap 'pkill -TERM -P $$ 2>/dev/null; exit 143' TERM INT HUP
