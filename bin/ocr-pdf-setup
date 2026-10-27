@@ -214,8 +214,8 @@ log "Installing the pinned packages without re-resolving dependencies."
 if ! with_timeout $PIP_TIMEOUT "$PY" -m pip install --no-deps -r "$REQ"; then
   fail_install "pip install of the pinned requirements failed or timed out"
 fi
-if ! "$PY" -c 'import kraken, torch, pymupdf, PIL, scipy.sparse.linalg'; then
-  fail_install "the venv cannot import kraken, torch, pymupdf, Pillow, or scipy.sparse.linalg"
+if ! "$PY" -c 'import kraken, torch, pymupdf, PIL, scipy.sparse.linalg, fontTools'; then
+  fail_install "the venv cannot import kraken, torch, pymupdf, Pillow, scipy.sparse.linalg, or fontTools"
 fi
 # kraken 7.1.1 wants scipy~=1.15.3. That wheel does not load on macOS 27;
 # scipy 1.16.3 does. pip check will complain. That complaint, and any other

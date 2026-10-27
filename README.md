@@ -42,11 +42,11 @@ ocr-pdf --help
 - `dither` is a Floyd-Steinberg black and white PNG.
 - `gray` is a greyscale JPEG. `JPEG_QUALITY` defaults to 32.
 - `spectre` is 300 dpi Otsu black and white, then JBIG2. The resolution is `SPECTRE_DPI` (default 300).
-- `graywhite` is a greyscale JPEG with a white background and grey type, in the manner of a ScanTailor greyscale export. The resolution is `DPI` (default 250) and the JPEG quality is `JPEG_QUALITY` (default 65). Unpaper is not run, so the page is not recropped or shifted. Kraken reads the plain grey rendering. The page image is cleaned after that.
+- `graywhite` is a greyscale JPEG with a white background and grey type, in the manner of a ScanTailor greyscale export. Ghostscript renders the page image at `PROCESS_DPI` (default 300). Illumination is flattened there, with no blur, and the page is Lanczos-downsampled to `DPI` (default 260) before the JPEG. `JPEG_QUALITY` defaults to 65. Unpaper is not run, so the page is not recropped or shifted. Kraken reads a separate uncleaned Ghostscript render at the output `DPI`. On a synthetic page the 300 dpi grey recognized worse than that render, so it is not the text source. `SHARPEN` (default 1) is a mild unsharp mask on the type after downsampling. `SHARPEN=0` turns that off. `SHARPEN=2` is stronger. The light seal is not sharpened.
 
 `OCR_LANGS=lat+ita` skips the language dialog. `FORCE=1` OCRs a PDF that already has real text. `NO_UI=1` turns off alerts. The comment at the top of `bin/ocr-pdf` lists the other settings.
 
-The invisible text stays selectable and searchable, and it stays lined up with the words on the page. The font for that layer is reduced to the characters actually used, instead of embedding a whole face.
+The invisible text stays selectable and searchable, and it stays lined up with the words on the page. The font for that layer is reduced to the characters actually used, instead of embedding a whole face. That subset is built with fontTools. Re-run `ocr-pdf-setup` if the Kraken virtualenv was created before fonttools was pinned; without it the face stays larger.
 
 Log: `~/Library/Logs/pdf_inbox_pipeline.log`
 
@@ -90,7 +90,7 @@ Package snapshots, if you want those gone too, are under `~/Library/Application 
 - [CATMuS-Print](https://doi.org/10.5281/zenodo.10592716) (Large), by Simon Gabay, Thibault Clérice, and contributors. DOI [10.5281/zenodo.10592716](https://doi.org/10.5281/zenodo.10592716). License [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
 - [OCRmyPDF](https://github.com/ocrmypdf/OCRmyPDF), by James R. Barlow and contributors. Mozilla Public License 2.0.
 
-Ghostscript and unpaper do the page image. `graywhite` does not use unpaper. The invisible-text font `pdf.ttf`, if [Tesseract](https://github.com/tesseract-ocr/tesseract) is installed, is the first choice for the text layer. Otherwise Helvetica is used. Tesseract is not required. When that font has no outlines for a character, the embedded face can be a system font such as Noto Serif; it is still subset to the characters on the page.
+Ghostscript and unpaper do the page image. `graywhite` does not use unpaper. The invisible-text font `pdf.ttf`, if [Tesseract](https://github.com/tesseract-ocr/tesseract) is installed, is the first choice for the text layer. Otherwise Helvetica is used. Tesseract is not required. When that font has no outlines for a character, the embedded face can be a system font such as Noto Serif. fontTools subsets it to the characters on the page. Re-run `ocr-pdf-setup` so an older virtualenv installs fonttools.
 
 ## Releasing
 

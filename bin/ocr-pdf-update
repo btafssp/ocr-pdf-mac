@@ -169,7 +169,7 @@ rebuild_venv() {
      { { [[ -n $snap ]] && install_pinned "$snap"; } ||
        { [[ -f $req ]] && log "snapshot install failed or missing; installing pinned requirements" && install_pinned "$req"; } ||
        { log "pinned requirements failed or missing; installing current kraken instead"
-         pip install kraken pillow 'pymupdf<2' 'scipy>=1.16'; } }; then
+         pip install kraken pillow 'pymupdf<2' 'scipy>=1.16' fonttools; } }; then
     log "venv rebuilt: $(versions)"
     rm -rf "$VENV.broken-$stamp"
     return 0
