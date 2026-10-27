@@ -21,7 +21,7 @@
 #           (skipped for MODE=graywhite: unpaper recrops and shifts the page)
 #        -> Pillow: cleaned grayscale copy for Kraken + final image per $MODE
 #           (graywhite: flatten at PROCESS_DPI, Lanczos down to DPI;
-#            Kraken reads a separate render at DPI)
+#            Kraken reads a plain grey render at OCR_DPI, default 250)
 #   3. Kraken (CATMuS-Print) segment -bl + ocr -> one ALTO file per page,
 #      several Kraken workers in parallel, with a stall watchdog
 #   4. PyMuPDF: page image + Kraken words as an invisible text layer
@@ -52,6 +52,8 @@
 #                                default 300; graywhite output default 260)
 #   PROCESS_DPI=300              graywhite only: Ghostscript resolution for
 #                                the page image, before downsampling to DPI
+#   OCR_DPI=250                  graywhite only: plain grey Kraken reads.
+#                                Independent of the output DPI.
 #   SPLIT=auto|always|never      auto: page wider than 1.25:1 = 2-up spread
 #   BLACKFILTER=on|off           unpaper black-border filter (off for faint print)
 #   OCR_LANGS=lat+ita            skip the picker (languages only name the file;
@@ -65,9 +67,10 @@
 #   KRAKEN_JOBS=N                parallel Kraken workers (default: min(cores/2, RAM GB/5, 4))
 #   PAGE_TIMEOUT=240             seconds without progress before giving up
 #   NO_UI=1                      no notifications / dialogs (testing, Terminal)
-#   JPEG_QUALITY=32              gray JPEG and ocrmypdf (graywhite default: 65)
-#   SHARPEN=1                    graywhite type-edge sharpen. 0 disables it.
-#                                2 is stronger. The 0.6 px blur is not used.
+#   JPEG_QUALITY=32              gray JPEG and ocrmypdf (graywhite default: 55)
+#   SHARPEN=0                    graywhite type-edge sharpen. 1 is a mild
+#                                unsharp on the type, 2 is stronger.
+#                                The 0.6 px blur is not used.
 #   BW_THRESHOLD=165
 # =============================================================================
 
@@ -149,21 +152,25 @@ else
 fi
 # graywhite flattens at this resolution, then Lanczos-downsamples to DPI.
 PROCESS_DPI="${PROCESS_DPI:-300}"
+# Kraken's grey. 250 dpi matched the real letter; the output DPI does not.
+OCR_DPI="${OCR_DPI:-250}"
 SPLIT="${SPLIT:-auto}"
 BLACKFILTER="${BLACKFILTER:-on}"
 KEEP_ALTO="${KEEP_ALTO:-0}"
 OUTPUT_TYPE="${OUTPUT_TYPE:-pdf}"
 FORCE="${FORCE:-0}"
 NO_UI="${NO_UI:-0}"
-# graywhite's tested page image is a greyscale JPEG at quality 65. An explicit
-# JPEG_QUALITY still wins, the same way the other modes take their settings.
+# graywhite default is quality 55 with sharpening off. On a full letter that
+# stays under about 364 KB. Quality 65 with sharpen 1 was the 412 KB file.
+# An explicit JPEG_QUALITY or SHARPEN still wins.
 if [[ "$MODE" == graywhite ]]; then
-  JPEG_QUALITY="${JPEG_QUALITY:-65}"
+  JPEG_QUALITY="${JPEG_QUALITY:-55}"
 else
   JPEG_QUALITY="${JPEG_QUALITY:-32}"
 fi
-# 1 is a mild unsharp on the type only. 0 leaves the cleaned page unsharpened.
-SHARPEN="${SHARPEN:-1}"
+# 0 leaves the type as the 300 dpi Lanczos downsample drew it. 1 unsharps
+# the type only. Paper and the light seal are not sharpened either way.
+SHARPEN="${SHARPEN:-0}"
 BW_THRESHOLD="${BW_THRESHOLD:-165}"
 KRAKEN_DEVICE="${KRAKEN_DEVICE:-cpu}"
 KRAKEN_MODEL="${KRAKEN_MODEL:-}"
@@ -233,16 +240,16 @@ if [[ "${1:-}" == __sheet ]]; then
   mkdir -p "$tmp"
   fail() { print -r -- "$*" >"$WORK/fail/$tag"; log "sheet $n: $*"; rm -rf "$tmp"; exit 1; }
 
-  # graywhite renders the page image at PROCESS_DPI. Kraken reads a
-  # separate Ghostscript render at the output DPI: on a synthetic page the
-  # 300 dpi grey recognized worse than the output-dpi grey.
+  # graywhite renders the page image at PROCESS_DPI. Kraken reads the
+  # plain grey at OCR_DPI (default 250), not at the output DPI. On the real
+  # letter, 250 dpi OCR matched the prototype and 260 dpi did not.
   render_dpi=$DPI
   kraken_flag=()
   if [[ "$MODE" == graywhite ]]; then
     render_dpi=$PROCESS_DPI
-    if [[ "$PROCESS_DPI" != "$DPI" ]]; then
+    if [[ "$OCR_DPI" != "$PROCESS_DPI" ]]; then
       with_timeout 180 $GS -dSAFER -dBATCH -dNOPAUSE -dQUIET -sDEVICE=pnggray \
-          -r"$DPI" -dFirstPage=$n -dLastPage=$n -o "$WORK/gray/$tag-1.png" "$IN_PDF" </dev/null \
+          -r"$OCR_DPI" -dFirstPage=$n -dLastPage=$n -o "$WORK/gray/$tag-1.png" "$IN_PDF" </dev/null \
         || fail "Ghostscript failed or timed out rendering page $n for OCR"
       kraken_flag=(reuse)
     fi
@@ -253,7 +260,7 @@ if [[ "${1:-}" == __sheet ]]; then
 
   # graywhite: do not run unpaper. Its mask and border steps recrop and shift
   # the page. The JPEG is cleaned at PROCESS_DPI, then Lanczos-downsampled
-  # to DPI. Kraken's grey is the uncleaned output-dpi render.
+  # to DPI. Kraken's grey is the uncleaned OCR_DPI render.
   if [[ "$MODE" == graywhite ]]; then
     with_timeout 180 "$PY" "$WORK/topage.py" "$tmp/sheet.png" "$WORK/pages/$tag-1" \
         "$WORK/gray/$tag-1.png" "$MODE" "$BW_THRESHOLD" "$JPEG_QUALITY" "$DPI" \
@@ -363,8 +370,8 @@ def sharpen_type(im, amount):
     mixed = a.astype(np.float32) * (1.0 - m) + np.asarray(sharp, np.float32) * m
     return Image.fromarray(np.clip(mixed + 0.5, 0, 255).astype(np.uint8))
 im = Image.open(src).convert("L")
-# "reuse": the shell already wrote Kraken's grey at the output dpi.
-# Otherwise Kraken reads this render (same grid as the JPEG).
+# "reuse": the shell already wrote Kraken's grey at OCR_DPI.
+# Otherwise Kraken reads this render (same grid as the opened image).
 if not (len(sys.argv) > 10 and sys.argv[10] == "reuse"):
     im.save(gray, format="PNG", dpi=(process_dpi, process_dpi))
 
@@ -1020,7 +1027,7 @@ process_one() {
   BASE="${pdf:t}"
   [[ -f "$pdf" ]] || { alert "OCR PDF" "File not found: $pdf"; return 1; }
   [[ "${pdf:l}" == *.pdf ]] || { alert "OCR PDF" "Not a PDF: $BASE"; return 1; }
-  log "=== $pdf  (MODE=$MODE DPI=$DPI PROCESS_DPI=$PROCESS_DPI SPLIT=$SPLIT BLACKFILTER=$BLACKFILTER JPEG_QUALITY=$JPEG_QUALITY SHARPEN=$SHARPEN)"
+  log "=== $pdf  (MODE=$MODE DPI=$DPI PROCESS_DPI=$PROCESS_DPI OCR_DPI=$OCR_DPI SPLIT=$SPLIT BLACKFILTER=$BLACKFILTER JPEG_QUALITY=$JPEG_QUALITY SHARPEN=$SHARPEN)"
 
   # private temp dir; removed on any exit (this function runs in a subshell)
   WORK=$(mktemp -d "${TMPDIR:-/tmp}/pdf_ocr.XXXXXX") || { alert "OCR PDF" "Cannot create temp dir"; return 1; }
@@ -1055,7 +1062,7 @@ process_one() {
   notify "Starting: $sheets page(s), languages $langs" "$BASE"
 
   # --- 2. rasterize + clean, all sheets in parallel ---
-  export IN_PDF="$pdf" WORK DPI PROCESS_DPI MODE SPLIT BLACKFILTER BW_THRESHOLD JPEG_QUALITY SHARPEN LOG
+  export IN_PDF="$pdf" WORK DPI PROCESS_DPI OCR_DPI MODE SPLIT BLACKFILTER BW_THRESHOLD JPEG_QUALITY SHARPEN LOG
   seq 1 $sheets | with_timeout 86400 /usr/bin/xargs -P $NCPU -n 1 "$SELF" __sheet 2>>"$LOG" &
   watch_progress "Cleaning page images" "$WORK/done" '*' $sheets $PAGE_TIMEOUT $!
   local rc=$?
@@ -1167,13 +1174,14 @@ MODE=bw|dither|gray|spectre|graywhite   (default bw)
              SPECTRE_DPI (default 300), not from DPI.
   graywhite  greyscale JPEG, white paper and grey type. Ghostscript renders
              the page image at PROCESS_DPI (default 300). It is Lanczos-
-             downsampled to DPI (default 260). JPEG_QUALITY (default 65).
-             Unpaper is skipped. Kraken reads a separate uncleaned render at
-             DPI. SHARPEN (default 1) sharpens the type after downsampling;
-             0 turns that off.
+             downsampled to DPI (default 260). JPEG_QUALITY (default 55).
+             Unpaper is skipped. Kraken reads the plain grey render at
+             OCR_DPI (default 250), not at the output DPI. SHARPEN (default 0)
+             leaves the type as downsampled. 1 sharpens the type only.
 
 DPI is the output resolution (graywhite default 260; spectre uses SPECTRE_DPI).
 PROCESS_DPI is the graywhite render resolution (default 300).
+OCR_DPI is the graywhite grey Kraken reads (default 250).
 OCR_LANGS=lat+ita skips the language dialog. FORCE=1 OCRs a PDF that already
 has real text. NO_UI=1 turns alerts off."
 }
