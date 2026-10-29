@@ -71,6 +71,8 @@
 #   PAGE_TIMEOUT=240             seconds without progress before giving up
 #   NO_UI=1                      no notifications / dialogs (testing, Terminal)
 #   OCR_PDF_ANSWER=yes|no        answer the 'OCR it anyway?' question (testing)
+#   KEEP_ORIGINAL=1              do not move the original to the Trash after OCR
+#   OCR_PDF_TRASH_CMD="cmd"      command used instead of /usr/bin/trash (testing)
 #   (several files / a folder = one batch: one language and one Yes/No question)
 #   JPEG_QUALITY=32              gray JPEG and ocrmypdf (graywhite default: 55)
 #   SHARPEN=0                    graywhite type-edge sharpen. 1 is a mild
@@ -100,7 +102,7 @@ SELF="${0:A}"
 LOG="$HOME/Library/Logs/pdf_inbox_pipeline.log"
 STATE_DIR="$HOME/Library/Application Support/pdf_inbox_pipeline"
 # Keep this fallback in step with share/ocr-pdf/VERSION.
-VERSION=0.2.2
+VERSION=0.2.3
 _verfile="${SELF:h:h}/share/ocr-pdf/VERSION"
 if [[ -r $_verfile ]]; then
   VERSION=$(<"$_verfile")
@@ -1279,19 +1281,17 @@ for a in "$@"; do
 done
 
 failures=0
+typeset -a pdfs
 if (( ${#files} <= 1 )); then
   # single file: unchanged behaviour (per-file questions and alerts)
   if (( ${#files} == 0 )); then
     alert "OCR PDF" "No PDFs found in the selection."; (( NO_UI == 1 )) && exit 1; exit 0
   fi
-  ( process_one "$files[1]" ) || (( failures++ ))
-  (( failures && NO_UI == 1 )) && exit 1
-  exit 0
-fi
+  pdfs=(${files[1]})
+else
 
 # ---- batch: ask languages and "OCR anyway?" once, then run without prompts ----
 BATCH=1
-typeset -a pdfs
 for f in $files; do [[ -f "$f" && "${f:l}" == *.pdf ]] && pdfs+=${f:A} || ignored+=$f; done
 log "batch: ${#pdfs} PDF(s), ${#ignored} other item(s) ignored"
 (( ${#ignored} )) && log "ignored: ${(j:, :)ignored}"
@@ -1312,19 +1312,69 @@ if (( ${#pdfs} )); then
   log "batch: languages $OCR_LANGS; $ntext already have text; answer ${OCR_PDF_ANSWER:-none (skip them)}"
   export OCR_PDF_ANSWER
 fi
+fi   # end batch setup
+
+# ---- trash the original once its OCR'd copy is verified ----
+# OCR_PDF_TRASH_CMD replaces the trash command (tests). KEEP_ORIGINAL=1 keeps it.
+trash_original() {   # trash_original input.pdf output.pdf
+  local in="$1" outp="$2" n_in n_out
+  [[ "${KEEP_ORIGINAL:-0}" == 1 ]] && { log "keeping original (KEEP_ORIGINAL=1): ${in:t}"; return 0; }
+  [[ -n "$outp" && -s "$outp" && "${outp:A}" != "${in:A}" ]] || { log "NOT trashing ${in:t}: output missing, empty or same path"; return 1; }
+  read n_in n_out < <("$PY" -c 'import sys, pymupdf
+def n(p):
+    try:
+        d = pymupdf.open(p); return d.page_count if d.is_pdf else -1
+    except Exception: return -1
+print(n(sys.argv[1]), n(sys.argv[2]))' "$in" "$outp" 2>>"$LOG")
+  # SPLIT can turn a two-page spread into two pages, so the output may have more
+  if [[ -z "${n_out:-}" ]] || (( n_out < 1 || n_in < 1 || n_out < n_in )); then
+    log "NOT trashing ${in:t}: output check failed (pages in=${n_in:-?} out=${n_out:-?})"; return 1
+  fi
+  if [[ -n "${OCR_PDF_TRASH_CMD:-}" ]]; then
+    ${=OCR_PDF_TRASH_CMD} "$in"
+  elif [[ -x /usr/bin/trash ]]; then
+    /usr/bin/trash "$in"
+  else
+    with_timeout 60 $OSASCRIPT -e 'on run argv' -e 'tell application "Finder" to delete (POSIX file (item 1 of argv) as alias)' -e 'end run' "$in" >/dev/null
+  fi && { log "moved original to Trash: $in"; return 0; }
+  log "could not move original to Trash: $in"; return 1
+}
+
+human_size() {   # bytes -> "1.2 MB" / "340 KB"
+  local b=$1
+  if (( b >= 1048576 )); then printf '%.1f MB' $(( b / 1048576.0 ))
+  else printf '%d KB' $(( (b + 512) / 1024 )); fi
+}
+
 ndone=0 nskip=${#ignored}; typeset -a failed_names
+bytes_in=0 bytes_out=0
 for f in $pdfs; do
   out=$( process_one "$f" ) && rc=0 || rc=$?
   [[ -n "$out" ]] && print -r -- "$out"
   if (( rc )); then (( failures++ )); failed_names+=${f:t}
-  elif [[ "$out" == *DONE=* ]]; then (( ndone++ ))
+  elif [[ "$out" == *DONE=* ]]; then
+    (( ndone++ ))
+    typeset -a outlines=("${(@f)out}")
+    o=${outlines[(R)DONE=*]#DONE=}
+    (( bytes_in += $(stat -f %z "$f"), bytes_out += $(stat -f %z "$o" 2>/dev/null || print 0) ))
+    trash_original "$f" "$o"
   else (( nskip++ )); fi
 done
-summary="Done $ndone, skipped $nskip, failed $failures."
-(( failures )) && summary+=" Failed: ${(j:, :)failed_names}. See $LOG"
+(( ndone == 1 )) && summary="1 file complete" || summary="$ndone files complete"
+if (( bytes_in > 0 )); then
+  saved=$(( bytes_in - bytes_out ))
+  summary+="; $(printf '%.0f' $(( 100.0 * saved / bytes_in )))% compression"
+  (( saved >= 0 )) && summary+="; $(human_size $saved) saved" || summary+="; grew $(human_size $(( -saved )))"
+fi
+summary+="."
+(( nskip )) && summary="${summary%.}; $nskip skipped."
+(( failures )) && summary="${summary%.}; $failures failed."
+title="OCR PDF"; (( BATCH )) && title="OCR PDF: batch finished"
+log "SUMMARY: $summary"
+print -r -- "$summary"
+if (( failures && BATCH )); then alert "$title" "$summary Failed: ${(j:, :)failed_names}. See $LOG"
+else notify "$summary" "${title#OCR PDF: }"; fi
 BATCH=0
-if (( failures )); then alert "OCR PDF: batch finished" "$summary"; log "SUMMARY: $summary"
-else log "SUMMARY: $summary"; notify "$summary" "Batch finished"; fi
 # With UI on, errors were already shown in an alert; exit 0 so Automator does
 # not pop a second, cryptic error dialog. In Terminal/NO_UI, report failure.
 (( failures && NO_UI == 1 )) && exit 1
