@@ -102,7 +102,7 @@ SELF="${0:A}"
 LOG="$HOME/Library/Logs/pdf_inbox_pipeline.log"
 STATE_DIR="$HOME/Library/Application Support/pdf_inbox_pipeline"
 # Keep this fallback in step with share/ocr-pdf/VERSION.
-VERSION=0.2.4
+VERSION=0.2.5
 _verfile="${SELF:h:h}/share/ocr-pdf/VERSION"
 if [[ -r $_verfile ]]; then
   VERSION=$(<"$_verfile")
@@ -1374,13 +1374,30 @@ print(n(sys.argv[1]), n(sys.argv[2]))' "$in" "$outp" 2>>"$LOG")
   if [[ -z "${n_out:-}" ]] || (( n_out < 1 || n_in < 1 || n_out < n_in )); then
     log "NOT trashing ${in:t}: output check failed (pages in=${n_in:-?} out=${n_out:-?})"; return 1
   fi
+  # Each way is tried in turn; its error output goes to the log. The file may
+  # sit in OneDrive/iCloud (File Provider), which can refuse a move for a
+  # moment right after the OCR'd copy is written, so /usr/bin/trash gets retries.
+  local err try
   if [[ -n "${OCR_PDF_TRASH_CMD:-}" ]]; then
-    ${=OCR_PDF_TRASH_CMD} "$in"
-  elif [[ -x /usr/bin/trash ]]; then
-    /usr/bin/trash "$in"
+    err=$(${=OCR_PDF_TRASH_CMD} "$in" 2>&1) && { log "moved original to Trash: $in"; return 0; }
+    log "trash command failed: $err"
   else
-    with_timeout 60 $OSASCRIPT -e 'on run argv' -e 'tell application "Finder" to delete (POSIX file (item 1 of argv) as alias)' -e 'end run' "$in" >/dev/null
-  fi && { log "moved original to Trash: $in"; return 0; }
+    if [[ -x /usr/bin/trash ]]; then
+      for try in 1 2 3; do
+        err=$(/usr/bin/trash "$in" 2>&1) && [[ ! -e "$in" ]] && { log "moved original to Trash: $in"; return 0; }
+        log "/usr/bin/trash failed (try $try): ${err:-file still there}"
+        sleep 2
+      done
+    fi
+    err=$(with_timeout 60 $OSASCRIPT -e 'on run argv' -e 'tell application "Finder" to delete (POSIX file (item 1 of argv) as alias)' -e 'end run' "$in" 2>&1 >/dev/null) \
+      && [[ ! -e "$in" ]] && { log "moved original to Trash (Finder): $in"; return 0; }
+    log "Finder could not trash it: ${err:-file still there}"
+    # last resort: move it into ~/.Trash ourselves (unique name, never rm)
+    local dest="$HOME/.Trash/${in:t}"
+    [[ -e "$dest" ]] && dest="$HOME/.Trash/${${in:t}%.*} $(date +%H.%M.%S).${in:e}"
+    err=$(/bin/mv -n "$in" "$dest" 2>&1) && [[ ! -e "$in" ]] && { log "moved original to Trash (mv): $in -> $dest"; return 0; }
+    log "mv to ~/.Trash failed: ${err:-file still there}"
+  fi
   log "could not move original to Trash: $in"; return 1
 }
 
