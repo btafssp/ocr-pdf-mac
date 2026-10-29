@@ -11,7 +11,7 @@ setopt pipefail nounset extendedglob nullglob
 SELF=${0:A}
 BIN_DIR=${SELF:h}
 SHARE=${BIN_DIR:h}/share/ocr-pdf
-VERSION=0.1.1
+VERSION=0.2.0
 if [[ -r "$SHARE/VERSION" ]]; then
   VERSION=$(<"$SHARE/VERSION")
   VERSION=${VERSION//[[:space:]]/}
@@ -214,8 +214,8 @@ log "Installing the pinned packages without re-resolving dependencies."
 if ! with_timeout $PIP_TIMEOUT "$PY" -m pip install --no-deps -r "$REQ"; then
   fail_install "pip install of the pinned requirements failed or timed out"
 fi
-if ! "$PY" -c 'import kraken, torch, pymupdf, PIL, scipy.sparse.linalg'; then
-  fail_install "the venv cannot import kraken, torch, pymupdf, Pillow, or scipy.sparse.linalg"
+if ! "$PY" -c 'import kraken, torch, pymupdf, PIL, scipy.sparse.linalg, fontTools'; then
+  fail_install "the venv cannot import kraken, torch, pymupdf, Pillow, scipy.sparse.linalg, or fontTools"
 fi
 # kraken 7.1.1 wants scipy~=1.15.3. That wheel does not load on macOS 27;
 # scipy 1.16.3 does. pip check will complain. That complaint, and any other

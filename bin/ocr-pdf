@@ -16,9 +16,12 @@
 #      Tesseract, ...) is fine: it is replaced.
 #   1. language picker (one dialog; OCR_LANGS=lat+ita skips it)
 #   2. per sheet, in parallel (all cores):
-#        Ghostscript rasterize at $DPI grayscale
+#        Ghostscript rasterize grayscale (graywhite: PROCESS_DPI, else DPI)
 #        -> unpaper (split 2-up spreads, deskew, despeckle, black filter)
+#           (skipped for MODE=graywhite: unpaper recrops and shifts the page)
 #        -> Pillow: cleaned grayscale copy for Kraken + final image per $MODE
+#           (graywhite: flatten at PROCESS_DPI; Kraken reads that plain
+#            grey at OCR_DPI, default 300. Lanczos to DPI is the JPEG only)
 #   3. Kraken (CATMuS-Print) segment -bl + ocr -> one ALTO file per page,
 #      several Kraken workers in parallel, with a stall watchdog
 #   4. PyMuPDF: page image + Kraken words as an invisible text layer
@@ -38,8 +41,20 @@
 #   Automator:  MODE=spectre "/opt/homebrew/bin/ocr-pdf" "$@"
 #
 # Environment:
-#   MODE=bw|dither|gray|spectre  default bw; spectre = 300 dpi Otsu B&W, TIFF
-#   DPI=250                      raster dpi (spectre: SPECTRE_DPI, default 300)
+#   MODE=bw|dither|gray|spectre|graywhite
+#                                default bw
+#                                spectre = 300 dpi Otsu B&W, TIFF, then JBIG2
+#                                graywhite = white paper, grey type, greyscale
+#                                JPEG. Unpaper is skipped. Ghostscript renders
+#                                at PROCESS_DPI (default 300); the page image
+#                                is downsampled to DPI (default 260).
+#   DPI=250                      raster / output dpi (spectre: SPECTRE_DPI,
+#                                default 300; graywhite output default 260)
+#   PROCESS_DPI=300              graywhite only: Ghostscript resolution for
+#                                the page image, before downsampling to DPI
+#   OCR_DPI=300                  graywhite only: plain grey Kraken reads.
+#                                Default matches PROCESS_DPI. The output DPI
+#                                is not the OCR grid.
 #   SPLIT=auto|always|never      auto: page wider than 1.25:1 = 2-up spread
 #   BLACKFILTER=on|off           unpaper black-border filter (off for faint print)
 #   OCR_LANGS=lat+ita            skip the picker (languages only name the file;
@@ -53,7 +68,11 @@
 #   KRAKEN_JOBS=N                parallel Kraken workers (default: min(cores/2, RAM GB/5, 4))
 #   PAGE_TIMEOUT=240             seconds without progress before giving up
 #   NO_UI=1                      no notifications / dialogs (testing, Terminal)
-#   JPEG_QUALITY=32  BW_THRESHOLD=165
+#   JPEG_QUALITY=32              gray JPEG and ocrmypdf (graywhite default: 55)
+#   SHARPEN=0                    graywhite type-edge sharpen. 1 is a mild
+#                                unsharp on the type, 2 is stronger.
+#                                The 0.6 px blur is not used.
+#   BW_THRESHOLD=165
 # =============================================================================
 
 emulate -R zsh
@@ -77,7 +96,7 @@ SELF="${0:A}"
 LOG="$HOME/Library/Logs/pdf_inbox_pipeline.log"
 STATE_DIR="$HOME/Library/Application Support/pdf_inbox_pipeline"
 # Keep this fallback in step with share/ocr-pdf/VERSION.
-VERSION=0.1.1
+VERSION=0.2.0
 _verfile="${SELF:h:h}/share/ocr-pdf/VERSION"
 if [[ -r $_verfile ]]; then
   VERSION=$(<"$_verfile")
@@ -124,15 +143,35 @@ fi
 
 # ---- settings ---------------------------------------------------------------
 MODE="${MODE:-bw}"
-DPI="${DPI:-250}"
-[[ "$MODE" == spectre ]] && DPI="${SPECTRE_DPI:-300}"
+# graywhite output is 260 dpi. The render is finer; see PROCESS_DPI.
+if [[ "$MODE" == spectre ]]; then
+  DPI="${SPECTRE_DPI:-300}"
+elif [[ "$MODE" == graywhite ]]; then
+  DPI="${DPI:-260}"
+else
+  DPI="${DPI:-250}"
+fi
+# graywhite flattens at this resolution, then Lanczos-downsamples to DPI.
+PROCESS_DPI="${PROCESS_DPI:-300}"
+# Kraken's grey. Same grid as the cleaning render, not the output JPEG.
+OCR_DPI="${OCR_DPI:-300}"
 SPLIT="${SPLIT:-auto}"
 BLACKFILTER="${BLACKFILTER:-on}"
 KEEP_ALTO="${KEEP_ALTO:-0}"
 OUTPUT_TYPE="${OUTPUT_TYPE:-pdf}"
 FORCE="${FORCE:-0}"
 NO_UI="${NO_UI:-0}"
-JPEG_QUALITY="${JPEG_QUALITY:-32}"
+# graywhite default is quality 55 with sharpening off. On a full letter that
+# stays under about 364 KB. Quality 65 with sharpen 1 was the 412 KB file.
+# An explicit JPEG_QUALITY or SHARPEN still wins.
+if [[ "$MODE" == graywhite ]]; then
+  JPEG_QUALITY="${JPEG_QUALITY:-55}"
+else
+  JPEG_QUALITY="${JPEG_QUALITY:-32}"
+fi
+# 0 leaves the type as the 300 dpi Lanczos downsample drew it. 1 unsharps
+# the type only. Paper and the light seal are not sharpened either way.
+SHARPEN="${SHARPEN:-0}"
 BW_THRESHOLD="${BW_THRESHOLD:-165}"
 KRAKEN_DEVICE="${KRAKEN_DEVICE:-cpu}"
 KRAKEN_MODEL="${KRAKEN_MODEL:-}"
@@ -202,9 +241,37 @@ if [[ "${1:-}" == __sheet ]]; then
   mkdir -p "$tmp"
   fail() { print -r -- "$*" >"$WORK/fail/$tag"; log "sheet $n: $*"; rm -rf "$tmp"; exit 1; }
 
+  # graywhite renders once, at PROCESS_DPI. Cleaning stays on that
+  # raster. Kraken reads it too when OCR_DPI matches (the default, 300).
+  # A different OCR_DPI is a second plain-grey render. The JPEG is the
+  # only image downsampled, later, to the output DPI.
+  render_dpi=$DPI
+  kraken_flag=()
+  if [[ "$MODE" == graywhite ]]; then
+    render_dpi=$PROCESS_DPI
+    if [[ "$OCR_DPI" != "$PROCESS_DPI" ]]; then
+      with_timeout 180 $GS -dSAFER -dBATCH -dNOPAUSE -dQUIET -sDEVICE=pnggray \
+          -r"$OCR_DPI" -dFirstPage=$n -dLastPage=$n -o "$WORK/gray/$tag-1.png" "$IN_PDF" </dev/null \
+        || fail "Ghostscript failed or timed out rendering page $n for OCR"
+      kraken_flag=(reuse)
+    fi
+  fi
   with_timeout 180 $GS -dSAFER -dBATCH -dNOPAUSE -dQUIET -sDEVICE=pnggray \
-      -r"$DPI" -dFirstPage=$n -dLastPage=$n -o "$tmp/sheet.png" "$IN_PDF" </dev/null \
+      -r"$render_dpi" -dFirstPage=$n -dLastPage=$n -o "$tmp/sheet.png" "$IN_PDF" </dev/null \
     || fail "Ghostscript failed or timed out rendering page $n"
+
+  # graywhite: do not run unpaper. Its mask and border steps recrop and shift
+  # the page. Cleaning stays at PROCESS_DPI. Lanczos to DPI is the JPEG
+  # only. Kraken's grey is the uncleaned OCR_DPI render (300 by default).
+  if [[ "$MODE" == graywhite ]]; then
+    with_timeout 180 "$PY" "$WORK/topage.py" "$tmp/sheet.png" "$WORK/pages/$tag-1" \
+        "$WORK/gray/$tag-1.png" "$MODE" "$BW_THRESHOLD" "$JPEG_QUALITY" "$DPI" \
+        "$SHARPEN" "$PROCESS_DPI" ${kraken_flag:-} </dev/null \
+      || fail "image cleanup (Pillow) failed on page $n"
+    rm -rf "$tmp"
+    : >"$WORK/done/$tag"
+    exit 0
+  fi
 
   # 2-up spread?
   split=0
@@ -231,7 +298,8 @@ if [[ "${1:-}" == __sheet ]]; then
   for f in $halves; do
     k=${${f:t:r}#half-}
     with_timeout 180 "$PY" "$WORK/topage.py" "$f" "$WORK/pages/$tag-$k" \
-        "$WORK/gray/$tag-$k.png" "$MODE" "$BW_THRESHOLD" "$JPEG_QUALITY" "$DPI" </dev/null \
+        "$WORK/gray/$tag-$k.png" "$MODE" "$BW_THRESHOLD" "$JPEG_QUALITY" "$DPI" \
+        "$SHARPEN" </dev/null \
       || fail "image cleanup (Pillow) failed on page $n"
   done
   rm -rf "$tmp"
@@ -272,9 +340,49 @@ import sys
 from PIL import Image, ImageFilter, ImageOps
 src, dst, gray, mode = sys.argv[1:5]
 thr, q, dpi = int(sys.argv[5]), int(sys.argv[6]), int(sys.argv[7])
+sharpen = 1.0
+if len(sys.argv) > 8:
+    try:
+        sharpen = float(sys.argv[8])
+    except ValueError:
+        sharpen = 1.0
+# graywhite renders at process_dpi and writes the JPEG at dpi.
+process_dpi = dpi
+if len(sys.argv) > 9:
+    try:
+        process_dpi = int(sys.argv[9])
+    except ValueError:
+        process_dpi = dpi
 res = (dpi, dpi)
+
+def sharpen_type(im, amount):
+    # amount 0 disables. 1 is radius 0.6 px at 60%, on pixels darker than
+    # the light seal, dilated so the stem edge is included. Paper is not.
+    if amount <= 0:
+        return im
+    percent = min(500, int(round(60 * amount)))
+    if percent <= 0:
+        return im
+    import numpy as np
+    sharp = im.filter(ImageFilter.UnsharpMask(radius=0.6, percent=percent, threshold=3))
+    a = np.asarray(im)
+    mask = Image.fromarray(np.where(a < 120, 255, 0).astype(np.uint8))
+    mask = mask.filter(ImageFilter.MaxFilter(3)).filter(ImageFilter.GaussianBlur(0.4))
+    m = np.asarray(mask, np.float32) / 255.0
+    mixed = a.astype(np.float32) * (1.0 - m) + np.asarray(sharp, np.float32) * m
+    return Image.fromarray(np.clip(mixed + 0.5, 0, 255).astype(np.uint8))
 im = Image.open(src).convert("L")
-im.save(gray, format="PNG", dpi=res)          # Kraken reads grayscale best
+# "reuse": the shell already wrote Kraken's grey at OCR_DPI.
+# Otherwise Kraken reads this render (same grid as the opened image).
+if not (len(sys.argv) > 10 and sys.argv[10] == "reuse"):
+    im.save(gray, format="PNG", dpi=(process_dpi, process_dpi))
+
+def to_output(image, src_dpi, out_dpi):
+    if src_dpi == out_dpi:
+        return image
+    ow = max(1, int(round(image.width * out_dpi / src_dpi)))
+    oh = max(1, int(round(image.height * out_dpi / src_dpi)))
+    return image.resize((ow, oh), Image.Resampling.LANCZOS)
 if mode == "gray":
     ImageOps.autocontrast(im, cutoff=1).save(dst + ".jpg", "JPEG", quality=q, optimize=True, dpi=res)
 elif mode == "dither":
@@ -300,9 +408,376 @@ elif mode == "spectre":
     bw = im.point(lambda p: 255 if p > cut else 0)
     bw = bw.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.MaxFilter(3))
     bw.convert("1").save(dst + ".tif", "TIFF", compression="tiff_lzw", dpi=res)
+elif mode == "graywhite":
+    # White paper, grey type, light seal. Flatten at the render resolution
+    # (PROCESS_DPI), with no blur, then Lanczos down to the output DPI.
+    # WHITE=0.92 BLACK=0.25 GAMMA=1. Greyscale JPEG has no chroma subsampling.
+    import numpy as np
+    a = np.asarray(im, np.float32)
+    f = max(1, process_dpi // 40)  # 300 dpi -> one seventh
+    sw, sh = max(1, im.width // f), max(1, im.height // f)
+    bg_im = im.resize((sw, sh), Image.BILINEAR)
+    if sw >= 7 and sh >= 7:
+        bg_im = bg_im.filter(ImageFilter.MaxFilter(7))
+    bg_im = bg_im.filter(ImageFilter.GaussianBlur(10))
+    bg = np.asarray(bg_im.resize(im.size, Image.BILINEAR), np.float32)
+    r = np.clip(a / np.maximum(bg, 1), 0, 1.5)
+    t = np.clip((r - 0.25) / (0.92 - 0.25), 0, 1) ** 1.0
+    out = Image.fromarray((t * 255 + 0.5).astype(np.uint8))
+    out = to_output(out, process_dpi, dpi)
+    out = sharpen_type(out, sharpen)
+    out.save(dst + ".jpg", "JPEG", quality=q, optimize=True, dpi=res)
 else:  # bw
     im = ImageOps.autocontrast(im, cutoff=1).filter(ImageFilter.MedianFilter(3))
     im.point(lambda p: 255 if p > thr else 0).convert("1").save(dst + ".png", "PNG", optimize=True, dpi=res)
+PY
+
+# --- fontsubset.py: compact Identity-H font, keep word positions --------
+cat >"$WORK/fontsubset.py" <<'PY'
+"""Compact an embedded Identity-H font down to the characters on the page.
+
+The replacement is the same face, with the same glyph advances, so word
+boxes do not move. CIDs in the content streams are rewritten to the
+compacted glyph ids, and ToUnicode and /W are rebuilt to match. fontTools
+does the subset. If it is missing, or the text would change, the document
+is left as it was.
+"""
+import os
+import re
+import sys
+import tempfile
+
+import pymupdf
+
+_HEX = re.compile(rb"<([0-9A-Fa-f]+)>")
+_REF = re.compile(r"(\d+)\s+0\s+R")
+# A full Noto Serif is ~280 KB and MuPDF's subset of it is still ~64 KB.
+# The compact subset of a page is a few KB. Anything under this is already
+# small enough that rewriting the PDF would not pay for itself.
+COMPACT_MAX = 48 * 1024
+
+
+def largest(doc):
+    n = 0
+    for _xref, buf, _enc in _embedded(doc):
+        n = max(n, len(buf))
+    return n
+
+
+def compact(doc):
+    return largest(doc) <= COMPACT_MAX
+
+
+def tighten(doc):
+    """Return True when the embedded font was replaced and the text matches."""
+    fonts = _embedded(doc)
+    if len(fonts) != 1:
+        return False
+    xref, buf, enc = fonts[0]
+    if enc != "/Identity-H":
+        return False
+    try:
+        from fontTools.ttLib import TTFont
+        from fontTools.subset import Subsetter, Options
+    except Exception as exc:
+        print(f"fontTools unavailable ({exc}); falling back to the MuPDF subsetter", file=sys.stderr)
+        return False
+    loc = _locate(doc, xref)
+    if loc is None:
+        return False
+    before_text = [page.get_text() for page in doc]
+    before_words = [page.get_text("words") for page in doc]
+    snap = _Snap(doc)
+    try:
+        _apply(doc, buf, loc, snap, TTFont, Subsetter, Options)
+    except Exception as exc:
+        snap.restore()
+        print(f"font subset skipped: {exc}", file=sys.stderr)
+        return False
+    # Page text drawn from a font program is cached. Reopen a copy to see
+    # the ToUnicode map that was just written.
+    if not _saved_text_matches(doc, before_text, before_words):
+        snap.restore()
+        print("font subset skipped: text or positions changed", file=sys.stderr)
+        return False
+    return True
+
+
+class _Snap:
+    def __init__(self, doc):
+        self.doc = doc
+        self.streams = {}
+        self.keys = []  # (xref, key, raw pdf value)
+
+    def stream(self, xref):
+        if xref not in self.streams:
+            self.streams[xref] = self.doc.xref_stream(xref)
+
+    def key(self, xref, key):
+        typ, val = self.doc.xref_get_key(xref, key)
+        self.keys.append((xref, key, val if typ != "null" else None))
+
+    def restore(self):
+        for xref, data in self.streams.items():
+            self.doc.update_stream(xref, data, compress=True)
+        for xref, key, val in self.keys:
+            if val is not None:
+                self.doc.xref_set_key(xref, key, val)
+
+
+def pages_match(text_a, words_a, text_b, words_b, tol=0.2):
+    """Text must be identical. Word boxes may move by under a pixel of rounding."""
+    if text_a != text_b or len(words_a) != len(words_b):
+        return False
+    for page_a, page_b in zip(words_a, words_b):
+        if len(page_a) != len(page_b):
+            return False
+        for a, b in zip(page_a, page_b):
+            if a[4:] != b[4:]:
+                return False
+            if any(abs(x - y) > tol for x, y in zip(a[:4], b[:4])):
+                return False
+    return True
+
+
+def _saved_text_matches(doc, before_text, before_words):
+    fd, tmp = tempfile.mkstemp(suffix=".pdf")
+    os.close(fd)
+    try:
+        doc.save(tmp, garbage=1, deflate=True)
+        check = pymupdf.open(tmp)
+        try:
+            return pages_match(
+                before_text, before_words,
+                [page.get_text() for page in check],
+                [page.get_text("words") for page in check],
+            )
+        finally:
+            check.close()
+    finally:
+        os.remove(tmp)
+
+
+def _embedded(doc):
+    found = []
+    seen = set()
+    for page in doc:
+        for font in page.get_fonts(full=True):
+            xref = font[0]
+            if not xref or xref in seen:
+                continue
+            seen.add(xref)
+            try:
+                info = doc.extract_font(xref)
+            except Exception:
+                continue
+            buf = info[3] if info else None
+            if not buf:
+                continue
+            enc = ""
+            try:
+                typ, val = doc.xref_get_key(xref, "Encoding")
+                if typ == "name":
+                    enc = val
+            except Exception:
+                pass
+            found.append((xref, buf, enc))
+    return found
+
+
+def _locate(doc, type0):
+    _typ, val = doc.xref_get_key(type0, "DescendantFonts")
+    cid = _ref(val)
+    if not cid:
+        return None
+    _typ, val = doc.xref_get_key(cid, "FontDescriptor")
+    fd = _ref(val)
+    if not fd:
+        return None
+    stream = None
+    for key in ("FontFile2", "FontFile3", "FontFile"):
+        typ, val = doc.xref_get_key(fd, key)
+        if typ == "xref" and _ref(val):
+            stream = _ref(val)
+            break
+    if not stream:
+        return None
+    typ, val = doc.xref_get_key(type0, "ToUnicode")
+    tu = _ref(val) if typ == "xref" else None
+    return cid, stream, tu
+
+
+def _ref(val):
+    m = _REF.search(val or "")
+    return int(m.group(1)) if m else None
+
+
+def _apply(doc, buf, loc, snap, TTFont, Subsetter, Options):
+    import io
+    cid_xref, stream_xref, tu_xref = loc
+    contents = []
+    seen = set()
+    for page in doc:
+        for xref in page.get_contents():
+            if xref not in seen:
+                seen.add(xref)
+                contents.append(xref)
+    used = set()
+    raws = {}
+    for xref in contents:
+        data = doc.xref_stream(xref)
+        raws[xref] = data
+        for m in _HEX.finditer(data):
+            body = m.group(1)
+            if len(body) % 4:
+                continue
+            for i in range(0, len(body), 4):
+                used.add(int(body[i:i + 4], 16))
+    if not used:
+        raise RuntimeError("no Identity-H character codes in the text")
+
+    old = TTFont(io.BytesIO(buf))
+    old_order = list(old.getGlyphOrder())
+    if max(used) >= len(old_order):
+        raise RuntimeError("character code past the end of the font")
+    uni = _tounicode(doc, tu_xref)
+    # MuPDF's own subset drops the cmap. ToUnicode still names the characters.
+    try:
+        cmap = old.getBestCmap() or {}
+    except Exception:
+        cmap = {}
+    rev = {}
+    for u, name in cmap.items():
+        rev.setdefault(name, u)
+
+    font = TTFont(io.BytesIO(buf))
+    opt = Options()
+    opt.layout_features = []
+    opt.desubroutinize = True
+    opt.hinting = False
+    opt.glyph_names = False
+    opt.retain_gids = False
+    opt.notdef_outline = False
+    opt.drop_tables = ["GSUB", "GPOS", "GDEF", "DSIG"]
+    opt.name_IDs = [1, 2, 4, 6]
+    opt.legacy_kern = False
+    sub = Subsetter(options=opt)
+    sub.populate(gids=sorted(used))
+    sub.subset(font)
+    new_order = list(font.getGlyphOrder())
+    old_gid = {name: i for i, name in enumerate(old_order)}
+    mapping = {old_gid[name]: i for i, name in enumerate(new_order) if name in old_gid}
+
+    upem = font["head"].unitsPerEm or 1000
+    scale = 1000.0 / upem
+    hmtx = old["hmtx"].metrics
+    widths = {}
+    pairs = []
+    for name, new_gid in ((n, i) for i, n in enumerate(new_order)):
+        if name not in hmtx:
+            continue
+        widths[new_gid] = int(round(hmtx[name][0] * scale))
+        if name == ".notdef":
+            continue
+        old_id = old_gid.get(name)
+        hx = uni.get(old_id) if old_id is not None else None
+        if hx is None and name in rev:
+            hx = f"{rev[name]:04X}"
+        if hx:
+            pairs.append((new_gid, hx))
+
+    outb = io.BytesIO()
+    font.save(outb)
+    new_bytes = outb.getvalue()
+
+    for xref, data in raws.items():
+        snap.stream(xref)
+        doc.update_stream(xref, _rewrite(data, mapping), compress=True)
+    snap.stream(stream_xref)
+    snap.key(stream_xref, "Length1")
+    doc.update_stream(stream_xref, new_bytes, compress=True)
+    doc.xref_set_key(stream_xref, "Length1", str(len(new_bytes)))
+    snap.key(cid_xref, "W")
+    doc.xref_set_key(cid_xref, "W", _widths(widths))
+    if tu_xref and pairs:
+        snap.stream(tu_xref)
+        doc.update_stream(tu_xref, _cmap(pairs), compress=True)
+
+
+def _rewrite(data, mapping):
+    def repl(m):
+        body = m.group(1)
+        if len(body) % 4:
+            return m.group(0)
+        parts = []
+        for i in range(0, len(body), 4):
+            cid = int(body[i:i + 4], 16)
+            parts.append(f"{mapping.get(cid, 0):04X}")
+        return b"<" + "".join(parts).encode("ascii") + b">"
+    return _HEX.sub(repl, data)
+
+
+def _widths(widths):
+    return "[ " + " ".join(f"{cid} [{widths[cid]}]" for cid in sorted(widths)) + " ]"
+
+
+def _cmap(pairs):
+    lines = [
+        "/CIDInit /ProcSet findresource begin",
+        "12 dict begin",
+        "begincmap",
+        "/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def",
+        "/CMapName /Adobe-Identity-UCS def",
+        "/CMapType 2 def",
+        "1 begincodespacerange",
+        "<0000> <FFFF>",
+        "endcodespacerange",
+    ]
+    pairs = sorted(pairs)
+    for i in range(0, len(pairs), 100):
+        chunk = pairs[i:i + 100]
+        lines.append(f"{len(chunk)} beginbfchar")
+        for cid, hx in chunk:
+            lines.append(f"<{cid:04X}> <{hx}>")
+        lines.append("endbfchar")
+    lines += [
+        "endcmap",
+        "CMapName currentdict /CMap defineresource pop",
+        "end",
+        "end",
+        "",
+    ]
+    return "\n".join(lines).encode("ascii")
+
+
+def _tounicode(doc, xref):
+    out = {}
+    if not xref:
+        return out
+    text = doc.xref_stream(xref).decode("latin1", errors="replace")
+    for block in re.finditer(r"beginbfchar(.*?)endbfchar", text, re.S):
+        for src, dst in re.findall(r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>", block.group(1)):
+            out[int(src, 16)] = dst.upper()
+    for block in re.finditer(r"beginbfrange(.*?)endbfrange", text, re.S):
+        body = block.group(1)
+        body_simple = re.sub(r"<[0-9A-Fa-f]+>\s*<[0-9A-Fa-f]+>\s*\[.*?\]", "", body, flags=re.S)
+        for m in re.finditer(
+            r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\[(.*?)\]", body, re.S
+        ):
+            a = int(m.group(1), 16)
+            dsts = re.findall(r"<([0-9A-Fa-f]+)>", m.group(3))
+            for i, dst in enumerate(dsts):
+                out[a + i] = dst.upper()
+        for m in re.finditer(
+            r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>", body_simple
+        ):
+            a = int(m.group(1), 16)
+            b = int(m.group(2), 16)
+            dst = int(m.group(3), 16)
+            width = len(m.group(3))
+            for i, cid in enumerate(range(a, b + 1)):
+                out[cid] = f"{dst + i:0{width}X}"
+    return out
 PY
 
 # --- altolayer.py: page images + invisible Kraken text -> one PDF -----------
@@ -311,15 +786,34 @@ import sys, glob, os
 import xml.etree.ElementTree as ET
 import pymupdf
 pagedir, altodir, out, dpi = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
-k = 72.0 / dpi
 glyphless = sys.argv[5] if len(sys.argv) > 5 else ""   # invisible-text font, if present
+# Kraken's pixels, when the render is finer than the JPEG. Empty: same grid.
+graydir = sys.argv[6] if len(sys.argv) > 6 else ""
 font = pymupdf.Font(fontfile=glyphless) if glyphless and os.path.exists(glyphless) else pymupdf.Font("helv")
 tag = lambda e: e.tag.rsplit("}", 1)[-1]
 doc = pymupdf.open()
 imgs = sorted(p for p in glob.glob(os.path.join(pagedir, "*"))
               if p.lower().endswith((".png", ".jpg", ".tif")))
 for img in imgs:
-    pix = pymupdf.Pixmap(img); w, h = pix.width * k, pix.height * k; pix = None
+    pix = pymupdf.Pixmap(img)
+    iw, ih = pix.width, pix.height
+    pix = None
+    # ALTO is in the grey render's pixels (OCR_DPI). The JPEG may be a
+    # smaller grid (output DPI). Scale each axis by the real pixel ratio,
+    # then to points. Width and height round independently.
+    scale_x, scale_y = 1.0, 1.0
+    if graydir:
+        gpath = os.path.join(graydir, os.path.splitext(os.path.basename(img))[0] + ".png")
+        if os.path.exists(gpath):
+            gp = pymupdf.Pixmap(gpath)
+            if gp.width:
+                scale_x = iw / float(gp.width)
+            if gp.height:
+                scale_y = ih / float(gp.height)
+            gp = None
+    kx = 72.0 / dpi * scale_x
+    ky = 72.0 / dpi * scale_y
+    w, h = iw * (72.0 / dpi), ih * (72.0 / dpi)
     page = doc.new_page(width=w, height=h)
     page.insert_image(page.rect, filename=img)
     alto = os.path.join(altodir, os.path.splitext(os.path.basename(img))[0] + ".xml")
@@ -331,9 +825,10 @@ for img in imgs:
         words = [s for s in line if tag(s) == "String" and s.get("CONTENT")]
         if not words:
             continue
-        box = [tuple(float(s.get(a, 0)) * k for a in ("HPOS", "VPOS", "WIDTH", "HEIGHT")) for s in words]
+        box = [(float(s.get("HPOS", 0)) * kx, float(s.get("VPOS", 0)) * ky,
+                float(s.get("WIDTH", 0)) * kx, float(s.get("HEIGHT", 0)) * ky) for s in words]
         texts = [s.get("CONTENT").replace("\u00ac", "-") for s in words]   # CATMuS line-end hyphen
-        ly, lh = float(line.get("VPOS", 0)) * k, float(line.get("HEIGHT", 0)) * k
+        ly, lh = float(line.get("VPOS", 0)) * ky, float(line.get("HEIGHT", 0)) * ky
         size = max(lh * 0.75, 4.0)
         # one horizontal scale per line, so the line extracts as one line
         natural = font.text_length(" ".join(texts), fontsize=size) or 1.0
@@ -345,7 +840,20 @@ for img in imgs:
             tw.append(pymupdf.Point(x0 + (bx - x0) / sx, base.y),
                       t + (" " if i < len(texts) - 1 else ""), font=font, fontsize=size)
         tw.write_text(page, render_mode=3, morph=(base, pymupdf.Matrix(sx, 1)))
-doc.save(out, garbage=3, deflate=True)
+# Glyphless pdf.ttf has no outlines, so PyMuPDF embeds a full system face
+# (Noto Serif is about 186 KB). Keep the characters used. MuPDF's subsetter
+# is the fallback when fontTools is not installed; it leaves a larger font.
+import fontsubset
+if not fontsubset.tighten(doc):
+    try:
+        doc.subset_fonts()
+    except Exception as exc:
+        print(f"font subset skipped: {exc}", file=sys.stderr)
+# One content stream per page. A stream per line cannot share a flate
+# dictionary; on a full page that was most of the non-image bytes.
+for page in doc:
+    page.clean_contents()
+doc.save(out, garbage=4, deflate=True, deflate_fonts=True)
 print(len(imgs))
 PY
 
@@ -356,6 +864,62 @@ d = pymupdf.open(sys.argv[1])
 chars = sum(len(p.get_text().strip()) for p in d)
 empty = sum(1 for p in d if len(p.get_text().strip()) < 20)
 print(d.page_count, chars, empty)
+PY
+
+# --- subsetfont.py: only when ocrmypdf put a full face back ----------------
+# --output-type pdf leaves the subset from altolayer.py alone, and pikepdf's
+# object streams are the small container. Saving again with PyMuPDF drops
+# those streams (about 9 KB here, more on a long letter). A PDF/A pass can
+# still substitute a full face; shrink that one, then put object streams back.
+cat >"$WORK/subsetfont.py" <<'PY'
+import os, sys
+import pymupdf
+import fontsubset
+path = sys.argv[1]
+doc = pymupdf.open(path)
+if fontsubset.compact(doc):
+    sys.exit(0)
+before_words = [page.get_text("words") for page in doc]
+before_text = [page.get_text() for page in doc]
+before = fontsubset.largest(doc)
+if not fontsubset.tighten(doc):
+    try:
+        doc.subset_fonts()
+    except Exception as exc:
+        print(f"font subset skipped: {exc}", file=sys.stderr)
+        sys.exit(0)
+    if fontsubset.largest(doc) > before - 1024:
+        sys.exit(0)
+tmp = path + ".subset"
+doc.save(tmp, garbage=4, deflate=True, deflate_fonts=True)
+doc.close()
+final = tmp
+try:
+    import pikepdf
+    pdf = pikepdf.open(tmp)
+    final = path + ".subset2"
+    pdf.save(final, compress_streams=True,
+             object_stream_mode=pikepdf.ObjectStreamMode.generate,
+             preserve_pdfa=True)
+    pdf.close()
+except Exception as exc:
+    print(f"keeping PyMuPDF container ({exc})", file=sys.stderr)
+    final = tmp
+check = pymupdf.open(final)
+ok = fontsubset.pages_match(
+    before_text, before_words,
+    [page.get_text() for page in check],
+    [page.get_text("words") for page in check])
+check.close()
+if not ok:
+    if final != tmp:
+        os.remove(final)
+    os.remove(tmp)
+    print("font subset skipped: text or positions changed", file=sys.stderr)
+    sys.exit(0)
+os.replace(final, path)
+if final != tmp and os.path.exists(tmp):
+    os.remove(tmp)
 PY
 }
 
@@ -471,7 +1035,7 @@ process_one() {
   BASE="${pdf:t}"
   [[ -f "$pdf" ]] || { alert "OCR PDF" "File not found: $pdf"; return 1; }
   [[ "${pdf:l}" == *.pdf ]] || { alert "OCR PDF" "Not a PDF: $BASE"; return 1; }
-  log "=== $pdf  (MODE=$MODE DPI=$DPI SPLIT=$SPLIT BLACKFILTER=$BLACKFILTER)"
+  log "=== $pdf  (MODE=$MODE DPI=$DPI PROCESS_DPI=$PROCESS_DPI OCR_DPI=$OCR_DPI SPLIT=$SPLIT BLACKFILTER=$BLACKFILTER JPEG_QUALITY=$JPEG_QUALITY SHARPEN=$SHARPEN)"
 
   # private temp dir; removed on any exit (this function runs in a subshell)
   WORK=$(mktemp -d "${TMPDIR:-/tmp}/pdf_ocr.XXXXXX") || { alert "OCR PDF" "Cannot create temp dir"; return 1; }
@@ -506,7 +1070,7 @@ process_one() {
   notify "Starting: $sheets page(s), languages $langs" "$BASE"
 
   # --- 2. rasterize + clean, all sheets in parallel ---
-  export IN_PDF="$pdf" WORK DPI MODE SPLIT BLACKFILTER BW_THRESHOLD JPEG_QUALITY LOG
+  export IN_PDF="$pdf" WORK DPI PROCESS_DPI OCR_DPI MODE SPLIT BLACKFILTER BW_THRESHOLD JPEG_QUALITY SHARPEN LOG
   seq 1 $sheets | with_timeout 86400 /usr/bin/xargs -P $NCPU -n 1 "$SELF" __sheet 2>>"$LOG" &
   watch_progress "Cleaning page images" "$WORK/done" '*' $sheets $PAGE_TIMEOUT $!
   local rc=$?
@@ -555,7 +1119,7 @@ process_one() {
   notify "Building PDF…" "$BASE"
   local npages=${#grays}
   with_timeout $(( 120 + 10 * npages )) "$PY" "$WORK/altolayer.py" "$WORK/pages" "$WORK/alto" \
-      "$WORK/layered.pdf" "$DPI" "${GLYPHLESS_FONT:-}" >/dev/null 2>>"$LOG" \
+      "$WORK/layered.pdf" "$DPI" "${GLYPHLESS_FONT:-}" "$WORK/gray" >/dev/null 2>>"$LOG" \
     || { alert "OCR PDF: failed" "Building the text layer failed or timed out. See $LOG"; return 1; }
 
   # --- 5. compress (no OCR engine at all) ---
@@ -565,6 +1129,12 @@ process_one() {
         --jobs "$NCPU" --quiet "$WORK/layered.pdf" "$final" </dev/null >>"$LOG" 2>&1; then
     log "WARNING: ocrmypdf optimize failed or timed out; keeping the uncompressed PDF"
     final="$WORK/layered.pdf"
+  fi
+
+  # Skip when the font is already compact: a PyMuPDF rewrite here drops
+  # ocrmypdf's object streams. PDF/A may still swap in a full face.
+  if ! "$PY" "$WORK/subsetfont.py" "$final" >>"$LOG" 2>&1; then
+    log "WARNING: font subset failed; keeping the text font as it is"
   fi
 
   # --- 6. verify + move into place ---
@@ -601,10 +1171,34 @@ process_one() {
 # =============================================================================
 # main
 # =============================================================================
+usage() {
+  print -u2 -- "Usage: ${SELF:t} [--version] [--no-blackfilter] [--keep-alto] [--force] file.pdf ...
+
+MODE=bw|dither|gray|spectre|graywhite   (default bw)
+  bw         black and white PNG. BW_THRESHOLD is the cutoff (default 165).
+  dither     Floyd-Steinberg black and white PNG.
+  gray       greyscale JPEG. JPEG_QUALITY (default 32).
+  spectre    300 dpi Otsu black and white TIFF, then JBIG2. DPI comes from
+             SPECTRE_DPI (default 300), not from DPI.
+  graywhite  greyscale JPEG, white paper and grey type. Ghostscript renders
+             the page image at PROCESS_DPI (default 300). It is Lanczos-
+             downsampled to DPI (default 260). JPEG_QUALITY (default 55).
+             Unpaper is skipped. Kraken reads the plain grey render at
+             OCR_DPI (default 300), the same grid as cleaning. Downsampling
+             to DPI is the saved JPEG only. SHARPEN (default 0) leaves the
+             type as downsampled. 1 sharpens the type only.
+
+DPI is the output resolution (graywhite default 260; spectre uses SPECTRE_DPI).
+PROCESS_DPI is the graywhite render and cleaning resolution (default 300).
+OCR_DPI is the graywhite grey Kraken reads (default 300).
+OCR_LANGS=lat+ita skips the language dialog. FORCE=1 OCRs a PDF that already
+has real text. NO_UI=1 turns alerts off."
+}
+
 while [[ $# -gt 0 && "$1" == --* ]]; do
   case "$1" in
     --version)        print -r -- "ocr-pdf $VERSION"; exit 0 ;;
-    --help)           print -u2 "Usage: ${SELF:t} [--version] [--no-blackfilter] [--keep-alto] [--force] file.pdf ..."; exit 0 ;;
+    --help)           usage; exit 0 ;;
     --no-blackfilter) BLACKFILTER=off ;;
     --blackfilter)    BLACKFILTER=on ;;
     --keep-alto)      KEEP_ALTO=1 ;;
@@ -616,7 +1210,7 @@ while [[ $# -gt 0 && "$1" == --* ]]; do
   shift
 done
 if (( $# == 0 )); then
-  print -u2 "Usage: ${SELF:t} [--version] [--no-blackfilter] [--keep-alto] [--force] file.pdf ..."
+  usage
   exit 2
 fi
 
@@ -626,6 +1220,12 @@ for tool in $GS $UNPAPER $OCRMYPDF $PY $KRAKEN; do
 done
 "$PY" -c 'import PIL, pymupdf' 2>/dev/null \
   || { alert "OCR PDF: missing Python module" "$PY needs Pillow and PyMuPDF:  $PY -m pip install pillow pymupdf"; exit 1; }
+"$PY" -c 'import fontTools' 2>/dev/null \
+  || log "WARNING: fonttools is not installed in the Kraken venv; the text font stays larger. Re-run ocr-pdf-setup."
+if [[ "$MODE" == graywhite ]]; then
+  "$PY" -c 'import numpy' 2>/dev/null \
+    || { alert "OCR PDF: missing Python module" "$PY needs numpy for MODE=graywhite. It ships in the Kraken venv."; exit 1; }
+fi
 
 # Stop button in the menu bar / Ctrl-C: take the running file's subshell down too.
 trap 'pkill -TERM -P $$ 2>/dev/null; exit 143' TERM INT HUP
