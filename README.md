@@ -25,6 +25,8 @@ The formula lives in the tap [btafssp/homebrew-tap](https://github.com/btafssp/h
 
 In Finder, right-click a scanned PDF, then Quick Actions, then OCR PDF. Choose the languages. They are used in the new file's name. The recognizer itself is multilingual.
 
+Batch: select several PDFs, or a folder, and run OCR PDF once. A folder means the PDFs directly inside it (not subfolders); other files and earlier outputs such as `name_lat.pdf` are ignored. You choose the languages once and, if any of the PDFs already have text, answer one Yes/No question for all of them. One summary at the end lists how many were done, skipped and failed.
+
 A file `letter.pdf` recognized as Latin and Italian becomes `letter_lat+ita.pdf` in the same folder.
 
 The Quick Action uses spectre mode (300 dpi black and white). From Terminal:

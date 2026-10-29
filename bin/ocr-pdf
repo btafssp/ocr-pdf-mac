@@ -39,7 +39,7 @@
 # Log: ~/Library/Logs/pdf_inbox_pipeline.log
 #
 # Usage:
-#   ocr-pdf [--version] [--no-blackfilter] [--keep-alto] [--force] file.pdf ...
+#   ocr-pdf [--version] [--no-blackfilter] [--keep-alto] [--force] file.pdf|folder ...
 #   Automator:  MODE=spectre "/opt/homebrew/bin/ocr-pdf" "$@"
 #
 # Environment:
@@ -71,6 +71,7 @@
 #   PAGE_TIMEOUT=240             seconds without progress before giving up
 #   NO_UI=1                      no notifications / dialogs (testing, Terminal)
 #   OCR_PDF_ANSWER=yes|no        answer the 'OCR it anyway?' question (testing)
+#   (several files / a folder = one batch: one language and one Yes/No question)
 #   JPEG_QUALITY=32              gray JPEG and ocrmypdf (graywhite default: 55)
 #   SHARPEN=0                    graywhite type-edge sharpen. 1 is a mild
 #                                unsharp on the type, 2 is stronger.
@@ -99,7 +100,7 @@ SELF="${0:A}"
 LOG="$HOME/Library/Logs/pdf_inbox_pipeline.log"
 STATE_DIR="$HOME/Library/Application Support/pdf_inbox_pipeline"
 # Keep this fallback in step with share/ocr-pdf/VERSION.
-VERSION=0.2.1
+VERSION=0.2.2
 _verfile="${SELF:h:h}/share/ocr-pdf/VERSION"
 if [[ -r $_verfile ]]; then
   VERSION=$(<"$_verfile")
@@ -206,7 +207,7 @@ AS
 # Blocking alert, brought to the front (only used for errors / skips).
 alert() {   # alert "title" "message"
   log "ALERT: $1 — $2"
-  [[ "$NO_UI" == 1 ]] && return 0
+  [[ "$NO_UI" == 1 || "${BATCH:-0}" == 1 ]] && return 0   # batch: one summary at the end
   with_timeout 900 $OSASCRIPT - "$1" "$2" >/dev/null 2>&1 <<'AS'
 on run argv
   activate
@@ -1080,6 +1081,7 @@ process_one() {
     if [[ -z "$answer" && "$NO_UI" != 1 && ! -t 0 ]]; then
       answer=$(ask_yes_no "OCR PDF" "$BASE already has real (publisher) text on most pages. Would you like me to OCR it anyway?")
     fi
+    [[ "${BATCH:-0}" == 1 && -z "$answer" ]] && answer=no   # batch: asked once up front
     case "${answer:l}" in
       yes) log "already has text; user chose to OCR anyway (as FORCE=1)" ;;
       no)  log "already has text; user chose not to OCR"; return 0 ;;
@@ -1200,7 +1202,7 @@ process_one() {
 # main
 # =============================================================================
 usage() {
-  print -u2 -- "Usage: ${SELF:t} [--version] [--no-blackfilter] [--keep-alto] [--force] file.pdf ...
+  print -u2 -- "Usage: ${SELF:t} [--version] [--no-blackfilter] [--keep-alto] [--force] file.pdf|folder ...
 
 MODE=bw|dither|gray|spectre|graywhite   (default bw)
   bw         black and white PNG. BW_THRESHOLD is the cutoff (default 165).
@@ -1219,8 +1221,11 @@ MODE=bw|dither|gray|spectre|graywhite   (default bw)
 DPI is the output resolution (graywhite default 260; spectre uses SPECTRE_DPI).
 PROCESS_DPI is the graywhite render and cleaning resolution (default 300).
 OCR_DPI is the graywhite grey Kraken reads (default 300).
+Several PDFs or a folder (its PDFs at the top level, not subfolders) run as
+one batch: languages and "OCR anyway?" are asked once, one summary at the end.
 OCR_LANGS=lat+ita skips the language dialog. FORCE=1 OCRs a PDF that already
-has real text. NO_UI=1 turns alerts off."
+has real text (OCR_PDF_ANSWER=yes|no answers the question for tests).
+NO_UI=1 turns alerts off."
 }
 
 while [[ $# -gt 0 && "$1" == --* ]]; do
@@ -1258,10 +1263,68 @@ fi
 # Stop button in the menu bar / Ctrl-C: take the running file's subshell down too.
 trap 'pkill -TERM -P $$ 2>/dev/null; exit 143' TERM INT HUP
 
-failures=0
-for f in "$@"; do
-  ( process_one "$f" ) || (( failures++ ))
+# Expand folders to the PDFs directly inside them (top level only, not
+# subfolders). Our own outputs (name_lat.pdf, name_lat+ita.pdf ...) are left out.
+typeset -a files ignored
+for a in "$@"; do
+  if [[ -d "$a" ]]; then
+    for f in "${a:A}"/*(N.on); do
+      if [[ "${f:l}" != *.pdf ]]; then ignored+=$f
+      elif [[ "${${f:t:r}:l}" == *_(lat|ita|fra|eng|spa|deu)(+(lat|ita|fra|eng|spa|deu))# ]]; then log "not an input (earlier output): ${f:t}"
+      else files+=$f; fi
+    done
+  else
+    files+=$a
+  fi
 done
+
+failures=0
+if (( ${#files} <= 1 )); then
+  # single file: unchanged behaviour (per-file questions and alerts)
+  if (( ${#files} == 0 )); then
+    alert "OCR PDF" "No PDFs found in the selection."; (( NO_UI == 1 )) && exit 1; exit 0
+  fi
+  ( process_one "$files[1]" ) || (( failures++ ))
+  (( failures && NO_UI == 1 )) && exit 1
+  exit 0
+fi
+
+# ---- batch: ask languages and "OCR anyway?" once, then run without prompts ----
+BATCH=1
+typeset -a pdfs
+for f in $files; do [[ -f "$f" && "${f:l}" == *.pdf ]] && pdfs+=${f:A} || ignored+=$f; done
+log "batch: ${#pdfs} PDF(s), ${#ignored} other item(s) ignored"
+(( ${#ignored} )) && log "ignored: ${(j:, :)ignored}"
+if (( ${#pdfs} )); then
+  WORK=$(mktemp -d "${TMPDIR:-/tmp}/pdf_ocr.XXXXXX") && write_helpers
+  ntext=0
+  for f in $pdfs; do
+    [[ "$(with_timeout 120 "$PY" "$WORK/textcheck.py" "$f" 2>>"$LOG")" == BORN_DIGITAL* ]] && (( ntext++ ))
+  done
+  rm -rf "$WORK"; unset WORK
+  OCR_LANGS=$(pick_langs "${#pdfs} PDFs (${pdfs[1]:t}, ...)")
+  [[ "$OCR_LANGS" == CANCEL ]] && { log "batch cancelled at language picker"; exit 0; }
+  [[ -n "$OCR_LANGS" ]] || OCR_LANGS=lat
+  export OCR_LANGS
+  if (( ntext )) && [[ "$FORCE" != 1 && -z "${OCR_PDF_ANSWER:-}" && "$NO_UI" != 1 && ! -t 0 ]]; then
+    OCR_PDF_ANSWER=$(ask_yes_no "OCR PDF" "$ntext of these PDFs already have text. Would you like me to OCR them anyway?")
+  fi
+  log "batch: languages $OCR_LANGS; $ntext already have text; answer ${OCR_PDF_ANSWER:-none (skip them)}"
+  export OCR_PDF_ANSWER
+fi
+ndone=0 nskip=${#ignored}; typeset -a failed_names
+for f in $pdfs; do
+  out=$( process_one "$f" ) && rc=0 || rc=$?
+  [[ -n "$out" ]] && print -r -- "$out"
+  if (( rc )); then (( failures++ )); failed_names+=${f:t}
+  elif [[ "$out" == *DONE=* ]]; then (( ndone++ ))
+  else (( nskip++ )); fi
+done
+summary="Done $ndone, skipped $nskip, failed $failures."
+(( failures )) && summary+=" Failed: ${(j:, :)failed_names}. See $LOG"
+BATCH=0
+if (( failures )); then alert "OCR PDF: batch finished" "$summary"; log "SUMMARY: $summary"
+else log "SUMMARY: $summary"; notify "$summary" "Batch finished"; fi
 # With UI on, errors were already shown in an alert; exit 0 so Automator does
 # not pop a second, cryptic error dialog. In Terminal/NO_UI, report failure.
 (( failures && NO_UI == 1 )) && exit 1

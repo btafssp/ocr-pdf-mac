@@ -24,6 +24,7 @@
 			<key>NSSendFileTypes</key>
 			<array>
 				<string>com.adobe.pdf</string>
+				<string>public.folder</string>
 			</array>
 		</dict>
 	</array>
