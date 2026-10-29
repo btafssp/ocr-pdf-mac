@@ -48,7 +48,7 @@ ocr-pdf --help
 
 `OCR_LANGS=lat+ita` skips the language dialog. `FORCE=1` OCRs a PDF that already has real text. `NO_UI=1` turns off alerts. The comment at the top of `bin/ocr-pdf` lists the other settings.
 
-The invisible text stays selectable and searchable, and it stays lined up with the words on the page. The font for that layer is reduced to the characters actually used, instead of embedding a whole face. That subset is built with fontTools. Re-run `ocr-pdf-setup` if the Kraken virtualenv was created before fonttools was pinned; without it the face stays larger.
+The invisible text stays selectable and searchable, and it stays lined up with the words on the page. In every mode, the font for that layer is reduced to the characters actually used, instead of embedding a whole face, so the file is smaller. That subset is built with fontTools. Re-run `ocr-pdf-setup` if the Kraken virtualenv was created before fonttools was pinned; without it the face stays larger.
 
 Log: `~/Library/Logs/pdf_inbox_pipeline.log`
 
