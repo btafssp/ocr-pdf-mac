@@ -102,7 +102,7 @@ SELF="${0:A}"
 LOG="$HOME/Library/Logs/pdf_inbox_pipeline.log"
 STATE_DIR="$HOME/Library/Application Support/pdf_inbox_pipeline"
 # Keep this fallback in step with share/ocr-pdf/VERSION.
-VERSION=0.2.5
+VERSION=0.2.6
 _verfile="${SELF:h:h}/share/ocr-pdf/VERSION"
 if [[ -r $_verfile ]]; then
   VERSION=$(<"$_verfile")
@@ -403,6 +403,7 @@ if len(sys.argv) > 9:
     except ValueError:
         process_dpi = dpi
 res = (dpi, dpi)
+MAX_BLACK = 0.40   # spectre: a page blacker than this is treated as bad
 
 def sharpen_type(im, amount):
     # amount 0 disables. 1 is radius 0.6 px at 60%, on pixels darker than
@@ -441,21 +442,43 @@ elif mode == "spectre":
     # Spectre-like B&W: autocontrast, Otsu threshold (+12 so thin type stays
     # black), morphological open/close. No illumination flattening (it washed
     # out thin, small type).
+    # The cutoff comes from real paper and ink only: unpaper paints the
+    # border pure white, and on a grey phone photo that white block pulled
+    # Otsu between paper and border, so the whole sheet turned black.
     im = ImageOps.autocontrast(im, cutoff=0.2)
-    hist = im.histogram(); total = sum(hist) or 1
-    sum1 = sum(i * h for i, h in enumerate(hist))
-    wB = sumB = best = 0.0; otsu = 160
-    for t in range(256):
-        wB += hist[t]
-        if not wB: continue
-        wF = total - wB
-        if not wF: break
-        sumB += t * hist[t]
-        v = wB * wF * (sumB / wB - (sum1 - sumB) / wF) ** 2
-        if v >= best: best, otsu = v, t
-    cut = min(250, otsu + 12)
-    bw = im.point(lambda p: 255 if p > cut else 0)
-    bw = bw.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.MaxFilter(3))
+    def otsu(hist):
+        total = sum(hist) or 1
+        sum1 = sum(i * h for i, h in enumerate(hist))
+        wB = sumB = best = 0.0; t_best = 160
+        for t in range(256):
+            wB += hist[t]
+            if not wB: continue
+            wF = total - wB
+            if not wF: break
+            sumB += t * hist[t]
+            v = wB * wF * (sumB / wB - (sum1 - sumB) / wF) ** 2
+            if v >= best: best, t_best = v, t
+        return t_best
+    def binarize(t):
+        cut = min(250, t + 12)
+        bw = im.point(lambda p: 255 if p > cut else 0)
+        bw = bw.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.MaxFilter(3))
+        h = bw.histogram()
+        return bw, h[0] / float(sum(h) or 1)
+    hist = im.histogram()
+    inner = list(hist); inner[0] = inner[255] = 0
+    t1 = otsu(inner) if sum(inner) else otsu(hist)
+    bw, black = binarize(t1)
+    note = f"cutoff {t1} (paper+ink), black {black:.0%}"
+    if black > MAX_BLACK:
+        t2 = otsu(hist)          # plain cutoff over the whole page
+        bw2, black2 = binarize(t2)
+        note += f"; plain cutoff {t2}, black {black2:.0%}"
+        if black2 < black:
+            bw, black = bw2, black2
+    if black > MAX_BLACK:
+        with open(dst + ".dark", "w") as fh:
+            fh.write(note + "\n")
     bw.convert("1").save(dst + ".tif", "TIFF", compression="tiff_lzw", dpi=res)
 elif mode == "graywhite":
     # White paper, grey type, light seal. Flatten at the render resolution
@@ -1239,8 +1262,17 @@ process_one() {
   if (( half_empty )); then
     alert "OCR PDF: warning" "More than half the pages of $BASE came back empty ($vempty of $npages). The PDF was still saved."
   fi
+  # spectre pages that stayed over 40% black: keep the PDF, flag the file
+  local -a dark=("$WORK"/pages/*.dark(N))
+  if (( ${#dark} )); then
+    local d; for d in $dark; do log "FLAGGED page ${${d:t}%.dark}: $(<$d)"; done
+    log "FLAGGED $BASE: ${#dark} page(s) came out mostly black; original kept"
+  fi
   print -r -- "DONE=$out"
-  [[ -n "${RESULT_FILE:-}" ]] && print -r -- "$out" >"$RESULT_FILE"
+  if [[ -n "${RESULT_FILE:-}" ]]; then
+    print -r -- "$out" >"$RESULT_FILE"
+    (( ${#dark} )) && print -r -- "FLAGGED" >>"$RESULT_FILE"
+  fi
   return 0
 }
 
@@ -1407,7 +1439,7 @@ human_size() {   # bytes -> "1.2 MB" / "340 KB"
   else printf '%d KB' $(( (b + 512) / 1024 )); fi
 }
 
-ndone=0 nskip=${#ignored}; typeset -a failed_names
+ndone=0 nskip=${#ignored} nflag=0; typeset -a failed_names flagged_names
 bytes_in=0 bytes_out=0
 # process_one runs in a plain ( ) subshell, as in 0.2.1, not inside $( ):
 # its dialogs open from a process whose output is not being captured.
@@ -1417,8 +1449,12 @@ trap 'rm -f "$RESULT_FILE"' EXIT
 for f in $pdfs; do
   : >"$RESULT_FILE"
   ( process_one "$f" ) && rc=0 || rc=$?
-  o=$(<"$RESULT_FILE")
+  typeset -a rlines=("${(@f)$(<"$RESULT_FILE")}")
+  o=${rlines[1]:-}
   if (( rc )); then (( failures++ )); failed_names+=${f:t}
+  elif [[ -n "$o" && "${rlines[2]:-}" == FLAGGED ]]; then
+    (( nflag++ )); flagged_names+=${f:t}
+    log "NOT trashing ${f:t}: pages came out mostly black (check ${o:t})"
   elif [[ -n "$o" ]]; then
     (( ndone++ ))
     (( bytes_in += $(stat -f %z "$f"), bytes_out += $(stat -f %z "$o" 2>/dev/null || print 0) ))
@@ -1433,11 +1469,13 @@ if (( bytes_in > 0 )); then
 fi
 summary+="."
 (( nskip )) && summary="${summary%.}; $nskip skipped."
+(( nflag )) && summary="${summary%.}; $nflag flagged (mostly black pages, original kept: ${(j:, :)flagged_names})."
 (( failures )) && summary="${summary%.}; $failures failed."
 title="OCR PDF"; (( BATCH )) && title="OCR PDF: batch finished"
 log "SUMMARY: $summary"
 print -r -- "$summary"
-if (( failures && BATCH )); then alert "$title" "$summary Failed: ${(j:, :)failed_names}. See $LOG"
+if (( nflag )); then alert "OCR PDF: check the output" "$summary See $LOG"
+elif (( failures && BATCH )); then alert "$title" "$summary Failed: ${(j:, :)failed_names}. See $LOG"
 else notify "$summary" "${title#OCR PDF: }"; fi
 BATCH=0
 # With UI on, errors were already shown in an alert; exit 0 so Automator does

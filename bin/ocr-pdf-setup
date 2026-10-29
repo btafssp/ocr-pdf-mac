@@ -11,7 +11,7 @@ setopt pipefail nounset extendedglob nullglob
 SELF=${0:A}
 BIN_DIR=${SELF:h}
 SHARE=${BIN_DIR:h}/share/ocr-pdf
-VERSION=0.2.5
+VERSION=0.2.6
 if [[ -r "$SHARE/VERSION" ]]; then
   VERSION=$(<"$SHARE/VERSION")
   VERSION=${VERSION//[[:space:]]/}
