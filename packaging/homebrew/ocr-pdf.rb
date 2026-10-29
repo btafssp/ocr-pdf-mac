@@ -1,8 +1,8 @@
 class OcrPdf < Formula
   desc "OCR scanned PDFs from Finder with Kraken"
   homepage "https://github.com/btafssp/ocr-pdf-mac"
-  url "https://github.com/btafssp/ocr-pdf-mac/archive/refs/tags/v0.2.5.tar.gz"
-  sha256 "d385f0f1d945c7a6e9c31159761046afeb188cf65467ec6899ace569125bb442"
+  url "https://github.com/btafssp/ocr-pdf-mac/archive/refs/tags/v0.2.6.tar.gz"
+  sha256 "e10dc554227663c4dce9b93678bad227c8d6d892a50ebfbe36fc4d2a82304b64"
   license "GPL-3.0-only"
 
   depends_on arch: :arm64
