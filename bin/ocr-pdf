@@ -20,8 +20,8 @@
 #        -> unpaper (split 2-up spreads, deskew, despeckle, black filter)
 #           (skipped for MODE=graywhite: unpaper recrops and shifts the page)
 #        -> Pillow: cleaned grayscale copy for Kraken + final image per $MODE
-#           (graywhite: flatten at PROCESS_DPI, Lanczos down to DPI;
-#            Kraken reads a plain grey render at OCR_DPI, default 250)
+#           (graywhite: flatten at PROCESS_DPI; Kraken reads that plain
+#            grey at OCR_DPI, default 300. Lanczos to DPI is the JPEG only)
 #   3. Kraken (CATMuS-Print) segment -bl + ocr -> one ALTO file per page,
 #      several Kraken workers in parallel, with a stall watchdog
 #   4. PyMuPDF: page image + Kraken words as an invisible text layer
@@ -52,8 +52,9 @@
 #                                default 300; graywhite output default 260)
 #   PROCESS_DPI=300              graywhite only: Ghostscript resolution for
 #                                the page image, before downsampling to DPI
-#   OCR_DPI=250                  graywhite only: plain grey Kraken reads.
-#                                Independent of the output DPI.
+#   OCR_DPI=300                  graywhite only: plain grey Kraken reads.
+#                                Default matches PROCESS_DPI. The output DPI
+#                                is not the OCR grid.
 #   SPLIT=auto|always|never      auto: page wider than 1.25:1 = 2-up spread
 #   BLACKFILTER=on|off           unpaper black-border filter (off for faint print)
 #   OCR_LANGS=lat+ita            skip the picker (languages only name the file;
@@ -152,8 +153,8 @@ else
 fi
 # graywhite flattens at this resolution, then Lanczos-downsamples to DPI.
 PROCESS_DPI="${PROCESS_DPI:-300}"
-# Kraken's grey. 250 dpi matched the real letter; the output DPI does not.
-OCR_DPI="${OCR_DPI:-250}"
+# Kraken's grey. Same grid as the cleaning render, not the output JPEG.
+OCR_DPI="${OCR_DPI:-300}"
 SPLIT="${SPLIT:-auto}"
 BLACKFILTER="${BLACKFILTER:-on}"
 KEEP_ALTO="${KEEP_ALTO:-0}"
@@ -240,9 +241,10 @@ if [[ "${1:-}" == __sheet ]]; then
   mkdir -p "$tmp"
   fail() { print -r -- "$*" >"$WORK/fail/$tag"; log "sheet $n: $*"; rm -rf "$tmp"; exit 1; }
 
-  # graywhite renders the page image at PROCESS_DPI. Kraken reads the
-  # plain grey at OCR_DPI (default 250), not at the output DPI. On the real
-  # letter, 250 dpi OCR matched the prototype and 260 dpi did not.
+  # graywhite renders once, at PROCESS_DPI. Cleaning stays on that
+  # raster. Kraken reads it too when OCR_DPI matches (the default, 300).
+  # A different OCR_DPI is a second plain-grey render. The JPEG is the
+  # only image downsampled, later, to the output DPI.
   render_dpi=$DPI
   kraken_flag=()
   if [[ "$MODE" == graywhite ]]; then
@@ -259,8 +261,8 @@ if [[ "${1:-}" == __sheet ]]; then
     || fail "Ghostscript failed or timed out rendering page $n"
 
   # graywhite: do not run unpaper. Its mask and border steps recrop and shift
-  # the page. The JPEG is cleaned at PROCESS_DPI, then Lanczos-downsampled
-  # to DPI. Kraken's grey is the uncleaned OCR_DPI render.
+  # the page. Cleaning stays at PROCESS_DPI. Lanczos to DPI is the JPEG
+  # only. Kraken's grey is the uncleaned OCR_DPI render (300 by default).
   if [[ "$MODE" == graywhite ]]; then
     with_timeout 180 "$PY" "$WORK/topage.py" "$tmp/sheet.png" "$WORK/pages/$tag-1" \
         "$WORK/gray/$tag-1.png" "$MODE" "$BW_THRESHOLD" "$JPEG_QUALITY" "$DPI" \
@@ -796,16 +798,21 @@ for img in imgs:
     pix = pymupdf.Pixmap(img)
     iw, ih = pix.width, pix.height
     pix = None
-    # ALTO is in the grey render's pixels. Scale onto the JPEG, then to points.
-    scale = 1.0
+    # ALTO is in the grey render's pixels (OCR_DPI). The JPEG may be a
+    # smaller grid (output DPI). Scale each axis by the real pixel ratio,
+    # then to points. Width and height round independently.
+    scale_x, scale_y = 1.0, 1.0
     if graydir:
         gpath = os.path.join(graydir, os.path.splitext(os.path.basename(img))[0] + ".png")
         if os.path.exists(gpath):
             gp = pymupdf.Pixmap(gpath)
             if gp.width:
-                scale = iw / float(gp.width)
+                scale_x = iw / float(gp.width)
+            if gp.height:
+                scale_y = ih / float(gp.height)
             gp = None
-    k = 72.0 / dpi * scale
+    kx = 72.0 / dpi * scale_x
+    ky = 72.0 / dpi * scale_y
     w, h = iw * (72.0 / dpi), ih * (72.0 / dpi)
     page = doc.new_page(width=w, height=h)
     page.insert_image(page.rect, filename=img)
@@ -818,9 +825,10 @@ for img in imgs:
         words = [s for s in line if tag(s) == "String" and s.get("CONTENT")]
         if not words:
             continue
-        box = [tuple(float(s.get(a, 0)) * k for a in ("HPOS", "VPOS", "WIDTH", "HEIGHT")) for s in words]
+        box = [(float(s.get("HPOS", 0)) * kx, float(s.get("VPOS", 0)) * ky,
+                float(s.get("WIDTH", 0)) * kx, float(s.get("HEIGHT", 0)) * ky) for s in words]
         texts = [s.get("CONTENT").replace("\u00ac", "-") for s in words]   # CATMuS line-end hyphen
-        ly, lh = float(line.get("VPOS", 0)) * k, float(line.get("HEIGHT", 0)) * k
+        ly, lh = float(line.get("VPOS", 0)) * ky, float(line.get("HEIGHT", 0)) * ky
         size = max(lh * 0.75, 4.0)
         # one horizontal scale per line, so the line extracts as one line
         natural = font.text_length(" ".join(texts), fontsize=size) or 1.0
@@ -1176,12 +1184,13 @@ MODE=bw|dither|gray|spectre|graywhite   (default bw)
              the page image at PROCESS_DPI (default 300). It is Lanczos-
              downsampled to DPI (default 260). JPEG_QUALITY (default 55).
              Unpaper is skipped. Kraken reads the plain grey render at
-             OCR_DPI (default 250), not at the output DPI. SHARPEN (default 0)
-             leaves the type as downsampled. 1 sharpens the type only.
+             OCR_DPI (default 300), the same grid as cleaning. Downsampling
+             to DPI is the saved JPEG only. SHARPEN (default 0) leaves the
+             type as downsampled. 1 sharpens the type only.
 
 DPI is the output resolution (graywhite default 260; spectre uses SPECTRE_DPI).
-PROCESS_DPI is the graywhite render resolution (default 300).
-OCR_DPI is the graywhite grey Kraken reads (default 250).
+PROCESS_DPI is the graywhite render and cleaning resolution (default 300).
+OCR_DPI is the graywhite grey Kraken reads (default 300).
 OCR_LANGS=lat+ita skips the language dialog. FORCE=1 OCRs a PDF that already
 has real text. NO_UI=1 turns alerts off."
 }
