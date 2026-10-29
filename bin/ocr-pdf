@@ -102,7 +102,7 @@ SELF="${0:A}"
 LOG="$HOME/Library/Logs/pdf_inbox_pipeline.log"
 STATE_DIR="$HOME/Library/Application Support/pdf_inbox_pipeline"
 # Keep this fallback in step with share/ocr-pdf/VERSION.
-VERSION=0.2.3
+VERSION=0.2.4
 _verfile="${SELF:h:h}/share/ocr-pdf/VERSION"
 if [[ -r $_verfile ]]; then
   VERSION=$(<"$_verfile")
@@ -211,10 +211,24 @@ alert() {   # alert "title" "message"
   log "ALERT: $1 — $2"
   [[ "$NO_UI" == 1 || "${BATCH:-0}" == 1 ]] && return 0   # batch: one summary at the end
   with_timeout 900 $OSASCRIPT - "$1" "$2" >/dev/null 2>&1 <<'AS'
+use AppleScript version "2.4"
+use framework "AppKit"
+use scripting additions
 on run argv
-  activate
+  bringFront()
   display alert (item 1 of argv) message (item 2 of argv) as warning giving up after 870
 end run
+on bringFront()
+  -- osascript is a background process; a bare 'activate' is only a request
+  -- that macOS can ignore. Ask AppKit to activate it too, then again by name.
+  try
+    (current application's NSApplication's sharedApplication())'s setActivationPolicy:0
+    (current application's NSRunningApplication's currentApplication())'s activateWithOptions:3
+  end try
+  activate
+  delay 0.15
+  activate
+end bringFront
 AS
 }
 
@@ -222,12 +236,26 @@ AS
 ask_yes_no() {   # ask_yes_no "title" "message"
   local r
   r=$(with_timeout 900 $OSASCRIPT - "$1" "$2" 2>/dev/null <<'AS'
+use AppleScript version "2.4"
+use framework "AppKit"
+use scripting additions
 on run argv
-  activate
+  bringFront()
   set d to display alert (item 1 of argv) message (item 2 of argv) as warning buttons {"No", "Yes"} default button "Yes" cancel button "No" giving up after 870
   if gave up of d then return "no"
   return "yes"
 end run
+on bringFront()
+  -- osascript is a background process; a bare 'activate' is only a request
+  -- that macOS can ignore. Ask AppKit to activate it too, then again by name.
+  try
+    (current application's NSApplication's sharedApplication())'s setActivationPolicy:0
+    (current application's NSRunningApplication's currentApplication())'s activateWithOptions:3
+  end try
+  activate
+  delay 0.15
+  activate
+end bringFront
 AS
 ) || r=no
   [[ "$r" == yes ]] && print yes || print no
@@ -963,8 +991,12 @@ pick_langs() {   # pick_langs "file name"  -> prints e.g. lat+ita
   local last="lat" chosen
   [[ -r "$STATE_DIR/last_langs" ]] && last=$(<"$STATE_DIR/last_langs")
   # Plain osascript (no Finder / System Events, so no Automation permission and
-  # no 2-minute Apple Event timeout). 'activate' brings the dialog to the front.
+  # no 2-minute Apple Event timeout). bringFront() activates osascript
+  # through AppKit and AppleScript so the dialog has keyboard focus.
   chosen=$(with_timeout 600 $OSASCRIPT - "$1" "$last" 2>>"$LOG" <<'AS'
+use AppleScript version "2.4"
+use framework "AppKit"
+use scripting additions
 on run argv
   set fname to item 1 of argv
   set lastCodes to item 2 of argv
@@ -974,12 +1006,23 @@ on run argv
     if lastCodes contains (text -4 thru -2 of L) then set end of defaults to (L as text)
   end repeat
   if defaults is {} then set defaults to {"Latin (lat)"}
-  activate
+  bringFront()
   set chosen to choose from list langList with title "OCR languages" with prompt ("Languages in:" & return & fname & return & return & "Command-click to choose several.") default items defaults OK button name "Start OCR" with multiple selections allowed
   if chosen is false then return "CANCEL"
   set AppleScript's text item delimiters to "+"
   return chosen as text
 end run
+on bringFront()
+  -- osascript is a background process; a bare 'activate' is only a request
+  -- that macOS can ignore. Ask AppKit to activate it too, then again by name.
+  try
+    (current application's NSApplication's sharedApplication())'s setActivationPolicy:0
+    (current application's NSRunningApplication's currentApplication())'s activateWithOptions:3
+  end try
+  activate
+  delay 0.15
+  activate
+end bringFront
 AS
   ) || { print CANCEL; return; }
   [[ "$chosen" == CANCEL || -z "$chosen" ]] && { print CANCEL; return; }
@@ -1197,6 +1240,7 @@ process_one() {
     alert "OCR PDF: warning" "More than half the pages of $BASE came back empty ($vempty of $npages). The PDF was still saved."
   fi
   print -r -- "DONE=$out"
+  [[ -n "${RESULT_FILE:-}" ]] && print -r -- "$out" >"$RESULT_FILE"
   return 0
 }
 
@@ -1348,14 +1392,18 @@ human_size() {   # bytes -> "1.2 MB" / "340 KB"
 
 ndone=0 nskip=${#ignored}; typeset -a failed_names
 bytes_in=0 bytes_out=0
+# process_one runs in a plain ( ) subshell, as in 0.2.1, not inside $( ):
+# its dialogs open from a process whose output is not being captured.
+# The output path comes back through RESULT_FILE.
+RESULT_FILE=$(mktemp "${TMPDIR:-/tmp}/ocr_pdf_result.XXXXXX"); export RESULT_FILE
+trap 'rm -f "$RESULT_FILE"' EXIT
 for f in $pdfs; do
-  out=$( process_one "$f" ) && rc=0 || rc=$?
-  [[ -n "$out" ]] && print -r -- "$out"
+  : >"$RESULT_FILE"
+  ( process_one "$f" ) && rc=0 || rc=$?
+  o=$(<"$RESULT_FILE")
   if (( rc )); then (( failures++ )); failed_names+=${f:t}
-  elif [[ "$out" == *DONE=* ]]; then
+  elif [[ -n "$o" ]]; then
     (( ndone++ ))
-    typeset -a outlines=("${(@f)out}")
-    o=${outlines[(R)DONE=*]#DONE=}
     (( bytes_in += $(stat -f %z "$f"), bytes_out += $(stat -f %z "$o" 2>/dev/null || print 0) ))
     trash_original "$f" "$o"
   else (( nskip++ )); fi
