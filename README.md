@@ -46,7 +46,7 @@ ocr-pdf --help
 
 `share/ocr-pdf/test-graywhite-align.py` checks that Kraken's grey stays at 300 dpi, that only the JPEG is 260 dpi, and that a word on the 300 dpi grey lands on that JPEG.
 
-`OCR_LANGS=lat+ita` skips the language dialog. `FORCE=1` OCRs a PDF that already has real text. `NO_UI=1` turns off alerts. The comment at the top of `bin/ocr-pdf` lists the other settings.
+`OCR_LANGS=lat+ita` skips the language dialog. `FORCE=1` OCRs a PDF that already has real text. From the Quick Action, such a PDF brings up a Yes/No question, "Would you like me to OCR it anyway?"; Yes runs the full cleanup, shrink and Kraken OCR and replaces the old text, No leaves the file alone. `OCR_PDF_ANSWER=yes` or `no` answers it without a dialog (for testing). `NO_UI=1` turns off alerts. The comment at the top of `bin/ocr-pdf` lists the other settings.
 
 The invisible text stays selectable and searchable, and it stays lined up with the words on the page. In every mode, the font for that layer is reduced to the characters actually used, instead of embedding a whole face, so the file is smaller. That subset is built with fontTools. Re-run `ocr-pdf-setup` if the Kraken virtualenv was created before fonttools was pinned; without it the face stays larger.
 

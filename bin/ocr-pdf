@@ -12,7 +12,9 @@
 # Pipeline, per input PDF:
 #   0. checks: tools present, PDF readable, and NOT already a born-digital
 #      (publisher) PDF with real visible text  -> those are skipped with an
-#      alert (FORCE=1 overrides). An old invisible OCR layer (ScanSnap,
+#      alert (FORCE=1 overrides; from the Quick Action, a Yes/No dialog asks
+#      whether to OCR it anyway, and Yes runs the full pipeline as FORCE=1).
+#      An old invisible OCR layer (ScanSnap,
 #      Tesseract, ...) is fine: it is replaced.
 #   1. language picker (one dialog; OCR_LANGS=lat+ita skips it)
 #   2. per sheet, in parallel (all cores):
@@ -68,6 +70,7 @@
 #   KRAKEN_JOBS=N                parallel Kraken workers (default: min(cores/2, RAM GB/5, 4))
 #   PAGE_TIMEOUT=240             seconds without progress before giving up
 #   NO_UI=1                      no notifications / dialogs (testing, Terminal)
+#   OCR_PDF_ANSWER=yes|no        answer the 'OCR it anyway?' question (testing)
 #   JPEG_QUALITY=32              gray JPEG and ocrmypdf (graywhite default: 55)
 #   SHARPEN=0                    graywhite type-edge sharpen. 1 is a mild
 #                                unsharp on the type, 2 is stronger.
@@ -96,7 +99,7 @@ SELF="${0:A}"
 LOG="$HOME/Library/Logs/pdf_inbox_pipeline.log"
 STATE_DIR="$HOME/Library/Application Support/pdf_inbox_pipeline"
 # Keep this fallback in step with share/ocr-pdf/VERSION.
-VERSION=0.2.0
+VERSION=0.2.1
 _verfile="${SELF:h:h}/share/ocr-pdf/VERSION"
 if [[ -r $_verfile ]]; then
   VERSION=$(<"$_verfile")
@@ -210,6 +213,21 @@ on run argv
   display alert (item 1 of argv) message (item 2 of argv) as warning giving up after 870
 end run
 AS
+}
+
+# Yes/No question, brought to the front; prints yes or no (no on timeout/error).
+ask_yes_no() {   # ask_yes_no "title" "message"
+  local r
+  r=$(with_timeout 900 $OSASCRIPT - "$1" "$2" 2>/dev/null <<'AS'
+on run argv
+  activate
+  set d to display alert (item 1 of argv) message (item 2 of argv) as warning buttons {"No", "Yes"} default button "Yes" cancel button "No" giving up after 870
+  if gave up of d then return "no"
+  return "yes"
+end run
+AS
+) || r=no
+  [[ "$r" == yes ]] && print yes || print no
 }
 
 # with_timeout SECONDS cmd ...
@@ -1056,8 +1074,18 @@ process_one() {
     alert "OCR PDF: skipped" "$BASE is password-protected."; return 1
   fi
   if [[ "$kind" == BORN_DIGITAL && "$FORCE" != 1 ]]; then
-    alert "OCR PDF: skipped" "$BASE already has real (publisher) text on most pages, so it was not OCRed. Run with FORCE=1 to OCR it anyway."
-    return 0
+    # Quick Action (no terminal on stdin, dialogs on): ask. Terminal/NO_UI: skip
+    # with the FORCE=1 hint as before. OCR_PDF_ANSWER=yes|no answers for tests.
+    local answer="${OCR_PDF_ANSWER:-}"
+    if [[ -z "$answer" && "$NO_UI" != 1 && ! -t 0 ]]; then
+      answer=$(ask_yes_no "OCR PDF" "$BASE already has real (publisher) text on most pages. Would you like me to OCR it anyway?")
+    fi
+    case "${answer:l}" in
+      yes) log "already has text; user chose to OCR anyway (as FORCE=1)" ;;
+      no)  log "already has text; user chose not to OCR"; return 0 ;;
+      *)   alert "OCR PDF: skipped" "$BASE already has real (publisher) text on most pages, so it was not OCRed. Run with FORCE=1 to OCR it anyway."
+           return 0 ;;
+    esac
   fi
   (( sheets > 0 )) || { alert "OCR PDF" "$BASE has no pages."; return 1; }
 
